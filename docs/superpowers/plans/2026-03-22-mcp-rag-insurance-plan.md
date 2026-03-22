@@ -19,6 +19,7 @@ GEO-Insurance-RAG/
 ├── docker/
 │   └── docker-compose.yml            # OpenSearch + Dashboards
 ├── src/
+│   ├── __init__.py                   # Package init
 │   ├── config.py                     # Env config loading, validation
 │   ├── logging_service.py            # Dual-write logger (file + OpenSearch)
 │   ├── rag.py                        # RAG-Anything/LightRAG init + wrapper
@@ -682,7 +683,12 @@ class RAGEngine:
         self._rag: RAGAnything | None = None
 
     async def initialize(self) -> None:
-        os_host = f"http://{self._os_cfg.host}:{self._os_cfg.port}"
+        # Configure OpenSearch env vars BEFORE LightRAG init
+        # LightRAG's OpenSearch adapters read from these env vars
+        import os
+        os.environ["OPENSEARCH_HOSTS"] = f"{self._os_cfg.host}:{self._os_cfg.port}"
+        os.environ["OPENSEARCH_USE_SSL"] = "false"
+        os.environ["OPENSEARCH_VERIFY_CERTS"] = "false"
 
         async def llm_func(prompt, system_prompt=None, history_messages=None, keyword_extraction=False, **kw):
             return await _llm_func(
@@ -723,7 +729,6 @@ class RAGEngine:
             vector_storage="OpenSearchVectorDBStorage",
             graph_storage="OpenSearchGraphStorage",
             doc_status_storage="OpenSearchDocStatusStorage",
-            env_opensearch_host=os_host,
         )
         await self._lightrag.initialize_storages()
 
@@ -734,7 +739,6 @@ class RAGEngine:
             embedding_func=self._lightrag.embedding_func,
             config=RAGAnythingConfig(
                 working_dir=self._working_dir,
-                mineru_parse_method="auto",
                 enable_image_processing=True,
                 enable_table_processing=True,
                 enable_equation_processing=True,
@@ -742,8 +746,7 @@ class RAGEngine:
         )
 
     async def query(self, question: str, mode: str = "hybrid", top_k: int = 5) -> str:
-        param = QueryParam(mode=mode, top_k=top_k)
-        return await self._rag.aquery(question, param=param)
+        return await self._rag.aquery(question, mode=mode, top_k=top_k)
 
     async def ingest_document(self, file_path: str, output_dir: str, device: str = "mps", lang: str = "ch") -> None:
         await self._rag.process_document_complete(
@@ -1113,15 +1116,43 @@ def compute_file_hash(file_path: str) -> str:
     return h.hexdigest()
 
 
+RETRY_DELAYS = [5, 15, 45]  # Exponential backoff in seconds
+
+
+async def _retry_async(coro_factory, retries=3, delays=RETRY_DELAYS):
+    """Retry an async operation with exponential backoff."""
+    last_error = None
+    for attempt in range(retries):
+        try:
+            return await coro_factory()
+        except Exception as e:
+            last_error = e
+            if attempt < retries - 1:
+                await asyncio.sleep(delays[attempt])
+    raise last_error
+
+
+def _read_parsed_content(output_dir: str, file_name: str) -> str:
+    """Read the markdown output from MinerU parsing.
+    MinerU / RAG-Anything saves parsed content as .md files in the output dir."""
+    stem = Path(file_name).stem
+    # Look for markdown output in common MinerU output patterns
+    for pattern in [f"{stem}/{stem}.md", f"{stem}.md", f"{stem}/auto/{stem}.md"]:
+        md_path = Path(output_dir) / pattern
+        if md_path.exists():
+            return md_path.read_text(encoding="utf-8")
+    return ""
+
+
 class IngestionPipeline:
     def __init__(self, config: AppConfig, rag_engine: RAGEngine, logger: RAGLogger):
         self._config = config
         self._rag = rag_engine
         self._logger = logger
         self._queue: asyncio.Queue = asyncio.Queue()
+        self._lock = asyncio.Lock()  # Ensures only one ingestion at a time
         self._doc_statuses: dict[str, dict] = {}
         self._known_hashes: set[str] = set()
-        self._processing = False
 
     def get_status(self, document_id: str) -> dict | None:
         return self._doc_statuses.get(document_id)
@@ -1140,26 +1171,24 @@ class IngestionPipeline:
             "stages": [],
             "metadata": None,
             "file_hash": None,
+            "ingested_at": None,
         }
         await self._queue.put((doc_id, file_path))
         return {"document_id": doc_id, "status": "pending"}
 
     async def process_queue(self) -> None:
-        """Process files from the queue one at a time."""
-        if self._processing:
-            return
-        self._processing = True
-        try:
+        """Process files from the queue one at a time (locked)."""
+        async with self._lock:
             while not self._queue.empty():
                 doc_id, file_path = await self._queue.get()
                 await self._process_single(doc_id, file_path)
-        finally:
-            self._processing = False
 
     async def _process_single(self, doc_id: str, file_path: str) -> None:
         """Process a single document through the full pipeline."""
+        from datetime import datetime, timezone
         status = self._doc_statuses[doc_id]
         file_name = Path(file_path).name
+        is_reprocess = False
 
         # Stage: validating
         status["status"] = "validating"
@@ -1179,9 +1208,10 @@ class IngestionPipeline:
         status["file_hash"] = file_hash
 
         if file_hash in self._known_hashes:
-            # Check if it's a partial doc needing re-processing
             existing = next((s for s in self._doc_statuses.values() if s.get("file_hash") == file_hash and s["document_id"] != doc_id), None)
-            if existing and existing.get("status") != "partial":
+            if existing and existing.get("status") == "partial":
+                is_reprocess = True  # Allow re-processing of partial docs
+            elif existing:
                 status["status"] = "failed"
                 status["stages"].append({"stage": "duplicate_check", "status": "skipped", "duration_ms": 0, "error": "Duplicate file"})
                 self._logger.log(document=file_name, stage="duplicate_check", status="skipped", details={"reason": "duplicate"})
@@ -1189,16 +1219,16 @@ class IngestionPipeline:
 
         self._known_hashes.add(file_hash)
 
-        # Stage: parsing
+        # Stage: parsing (with retry)
         status["status"] = "parsing"
         start = time.time()
         try:
-            await self._rag.ingest_document(
+            await _retry_async(lambda: self._rag.ingest_document(
                 file_path=file_path,
                 output_dir=self._config.paths.processed_dir,
                 device=self._config.mineru.device,
                 lang=self._config.mineru.lang,
-            )
+            ))
             elapsed = int((time.time() - start) * 1000)
             status["stages"].append({"stage": "parsing", "status": "success", "duration_ms": elapsed, "error": None})
             self._logger.log(document=file_name, stage="parsing", status="success", duration_ms=elapsed)
@@ -1210,10 +1240,14 @@ class IngestionPipeline:
             self._logger.log(document=file_name, stage="parsing", status="failed", duration_ms=elapsed, details={"error": str(e)})
             return
 
-        # Stage: extracting_metadata
+        # Stage: extracting_metadata (with retry)
         status["status"] = "extracting_metadata"
         start = time.time()
-        metadata = await extract_metadata("", self._config.llm)  # TODO: pass parsed content
+        parsed_content = _read_parsed_content(self._config.paths.processed_dir, file_name)
+        try:
+            metadata = await _retry_async(lambda: extract_metadata(parsed_content, self._config.llm))
+        except Exception:
+            metadata = {}
         elapsed = int((time.time() - start) * 1000)
 
         if metadata:
@@ -1224,14 +1258,31 @@ class IngestionPipeline:
             status["metadata"] = {}
             status["stages"].append({"stage": "extracting_metadata", "status": "failed", "duration_ms": elapsed, "error": "Metadata extraction failed"})
             status["status"] = "partial"
+            status["ingested_at"] = datetime.now(timezone.utc).isoformat()
             self._logger.log(document=file_name, stage="extracting_metadata", status="failed", duration_ms=elapsed)
-            # Move to processed even though partial
             shutil.move(file_path, str(Path(self._config.paths.processed_dir) / file_name))
             return
 
-        # Stage: indexing complete
+        # Stage: checking_version (skip for re-processed partial docs)
+        if not is_reprocess and metadata:
+            status["status"] = "checking_version"
+            existing_docs = [s for s in self._doc_statuses.values()
+                            if s["status"] in ("ready",) and s["document_id"] != doc_id]
+            match = find_existing_version(metadata, [s.get("metadata", {}) | {"document_id": s["document_id"]} for s in existing_docs if s.get("metadata")])
+            if match:
+                status["status"] = "awaiting_confirmation"
+                status["stages"].append({"stage": "checking_version", "status": "awaiting_confirmation", "duration_ms": 0, "error": None})
+                status["metadata"]["_matched_doc_id"] = match["document_id"]
+                self._logger.log(document=file_name, stage="checking_version", status="awaiting_confirmation",
+                                details={"matched": match["document_id"]})
+                return  # Wait for confirm_version_update tool call
+            else:
+                status["stages"].append({"stage": "checking_version", "status": "no_match", "duration_ms": 0, "error": None})
+
+        # Stage: complete
         status["status"] = "ready"
         status["metadata"]["is_latest"] = True
+        status["ingested_at"] = datetime.now(timezone.utc).isoformat()
         shutil.move(file_path, str(Path(self._config.paths.processed_dir) / file_name))
         self._logger.log(document=file_name, stage="complete", status="success")
 ```
@@ -1718,10 +1769,66 @@ pytest tests/test_server.py -v
 ```
 Expected: 1 PASSED
 
-- [ ] **Step 5: Add server startup logic at bottom of `server.py`**
+- [ ] **Step 5: Add server lifecycle initialization at bottom of `server.py`**
 
 ```python
 # Add to bottom of src/server.py
+
+async def _initialize():
+    """Initialize all components with OpenSearch health check retry."""
+    global _config, _rag_engine, _logger, _pipeline, _watcher
+
+    _config = load_config()
+    _logger = RAGLogger(log_dir=_config.paths.log_dir)
+
+    # OpenSearch health check: retry every 5s for 60s
+    from opensearchpy import OpenSearch
+    for attempt in range(12):
+        try:
+            client = OpenSearch(
+                hosts=[{"host": _config.opensearch.host, "port": _config.opensearch.port}],
+                use_ssl=False,
+            )
+            client.info()
+            break
+        except Exception:
+            if attempt < 11:
+                await asyncio.sleep(5)
+            else:
+                print("WARNING: OpenSearch not available, starting in degraded mode")
+
+    # Initialize RAG engine
+    _rag_engine = RAGEngine(
+        llm_config=_config.llm,
+        embedding_config=_config.embedding,
+        vision_config=_config.vision,
+        opensearch_config=_config.opensearch,
+        working_dir="./rag_working_dir",
+    )
+    try:
+        await _rag_engine.initialize()
+    except Exception as e:
+        print(f"WARNING: RAG engine init failed: {e}")
+
+    # Initialize ingestion pipeline
+    _pipeline = IngestionPipeline(config=_config, rag_engine=_rag_engine, logger=_logger)
+
+    # Start inbox watcher
+    def _on_new_file(file_path: str):
+        asyncio.create_task(_pipeline.enqueue(file_path))
+        asyncio.create_task(_pipeline.process_queue())
+
+    _watcher = InboxWatcher(
+        inbox_dir=_config.paths.inbox_dir,
+        on_new_file=_on_new_file,
+    )
+    _watcher.start()
+
+
+@mcp.on_event("startup")
+async def startup():
+    await _initialize()
+
 
 if __name__ == "__main__":
     _config = load_config()
