@@ -79,7 +79,7 @@ The system ingests PDF documents (product brochures, leaflets, training material
 | MCP Server | Python + FastMCP | Thin wrapper, stdio + Streamable HTTP |
 | RAG Engine | RAG-Anything + LightRAG | Multimodal RAG with knowledge graph |
 | PDF Parser | MinerU (MLX) | Mac ARM64 GPU accelerated, lang="ch" |
-| Storage | OpenSearch 3.x | Unified: KV, Vector, Graph, DocStatus |
+| Storage | OpenSearch 3.x | Unified via LightRAG native adapters: OpenSearchKVStorage, OpenSearchVectorDBStorage, OpenSearchGraphStorage, OpenSearchDocStatusStorage |
 | Inbox Monitor | watchdog | Real-time file system monitoring |
 | Package Manager | uv | Fast, modern Python package management |
 | Embedding | text-embedding-3-large | Via YIBU API |
@@ -91,7 +91,7 @@ The system ingests PDF documents (product brochures, leaflets, training material
 ## Deployment Topology
 
 ### Docker (docker-compose)
-- OpenSearch 3.x (single node, k-NN plugin, port 9200)
+- OpenSearch 3.x (single node, k-NN plugin, port 9200, **persistent named volume for data**)
 - OpenSearch Dashboards (port 5601)
 
 ### Local Python (uv)
@@ -128,7 +128,8 @@ GEO-Insurance-RAG/
 │
 ├── logs/                         # Local log files
 │
-├── .env                          # Environment variables
+├── .env                          # Environment variables (git-ignored)
+├── .env.example                  # Example environment variables (committed)
 ├── pyproject.toml                # uv dependency management
 └── README.md
 ```
@@ -226,18 +227,22 @@ PDF in inbox/ → Watchdog detects → Validate (PDF, ≤100MB)
 - **Retry policy**: 3 retries with exponential backoff (5s → 15s → 45s)
 - **Partial ingestion**: If metadata extraction fails but content parsing succeeds, index with empty metadata (status: `partial`)
 - **Validation failures**: Move immediately to `failed/` (no retry)
+- **Duplicate detection**: SHA-256 file hash checked before processing; duplicate files are skipped and logged
+- **Corrupt/encrypted PDFs**: If MinerU fails to open a PDF (corrupt or password-protected), move to `failed/` with descriptive error
 - **File formats**: PDF only
 - **File size**: Maximum 100MB
 - **Language**: Only Traditional Chinese versions ingested; documents with mixed Chinese/English content are supported
+- **Watchdog stabilization**: After detecting a new file, wait until file size is stable for 3 seconds before starting processing (prevents partial file reads during copy)
 
 ### Version Detection Logic
 
-1. After metadata extraction, search existing documents by `company` + `product_name`
+1. After metadata extraction, search existing documents by `company` + `product_name` + `document_type`
 2. If no match: index directly with `is_latest: true`
 3. If match found: set status to `awaiting_confirmation`, notify via MCP tool
 4. User confirms via `confirm_version_update` tool:
    - `replace: true` → old document `is_latest: false`, new document `is_latest: true`
    - `replace: false` → new document indexed independently with `is_latest: true`
+5. **Timeout**: Documents in `awaiting_confirmation` for more than 72 hours are automatically indexed as independent documents with `is_latest: true`
 
 ### Log Entry Format
 
@@ -290,6 +295,44 @@ All responses are in Chinese. The LLM in OpenClaw handles final answer generatio
 
 ---
 
+## MCP Tools — Error Response Schema
+
+All MCP tools return a standard error envelope on failure:
+
+```json
+{
+  "error": true,
+  "error_code": "OPENSEARCH_UNAVAILABLE",
+  "message": "OpenSearch is in degraded mode. Query and ingestion unavailable.",
+  "details": {
+    "last_connected": "2026-03-22T14:00:00Z",
+    "retry_in_seconds": 5
+  }
+}
+```
+
+Error codes:
+| Code | Description |
+|------|-------------|
+| `OPENSEARCH_UNAVAILABLE` | OpenSearch not connected |
+| `API_UNAVAILABLE` | YIBU API unreachable (LLM/embedding/vision) |
+| `VALIDATION_FAILED` | File validation failed (wrong format, too large) |
+| `DOCUMENT_NOT_FOUND` | Document ID does not exist |
+| `DUPLICATE_DOCUMENT` | File hash matches an already-ingested document |
+| `INGESTION_FAILED` | Ingestion pipeline failed after retries |
+| `INVALID_PARAMETERS` | Invalid tool parameters |
+
+### API Outage Handling
+
+When YIBU API is unavailable during ingestion:
+- **During metadata extraction**: Content is indexed with empty metadata (status: `partial`). Can be re-processed later via `ingest_document` to fill metadata.
+- **During knowledge graph construction**: Content is indexed as vector-only without graph relationships (status: `partial`). Re-ingestion rebuilds the graph.
+- **During embedding**: Ingestion is paused and retried (3 attempts). If API remains down, document stays in `pending` and watcher retries on next cycle.
+
+The `partial` status documents are fully queryable via vector search but may have degraded knowledge graph retrieval. Re-ingesting a `partial` document (same file hash) triggers re-processing instead of duplicate rejection.
+
+---
+
 ## MCP Tools Interface
 
 ### 1. `query` — Search insurance product information
@@ -301,8 +344,8 @@ Parameters:
     company: string               — Insurance company name
     product_type: string          — 儲蓄/醫療/人壽/意外
     document_type: string         — 產品小冊子/宣傳單張/...
-  mode: string (optional)         — hybrid|local|global|naive|mix
-                                    Default: hybrid
+  mode: string (optional)         — auto|hybrid|local|global|naive|mix
+                                    Default: auto (system selects best mode)
   top_k: int (optional)           — Number of results, default 5
   only_latest: bool (optional)    — Search latest versions only, default true
 
@@ -354,6 +397,8 @@ Parameters:
   document_id: string (optional)  — Specific document ID
   file_name: string (optional)    — Specific file name
   status_filter: string (optional)— Filter by status
+  limit: int (optional)           — Page size, default 20
+  offset: int (optional)          — Pagination offset, default 0
 
 Returns:
   documents: [{
@@ -369,6 +414,9 @@ Returns:
     }]
     metadata: object|null
   }]
+  total: int
+  limit: int
+  offset: int
 ```
 
 ### 5. `list_documents` — List all indexed documents
@@ -377,6 +425,8 @@ Returns:
 Parameters:
   filters: object (optional)      — Same as query filters
   only_latest: bool (optional)    — Default true
+  limit: int (optional)           — Page size, default 20
+  offset: int (optional)          — Pagination offset, default 0
 
 Returns:
   documents: [{
@@ -474,6 +524,23 @@ Both destinations receive identical structured JSON log entries covering every p
 | OpenSearch Dashboards | 5601 | Index data inspection, query debugging, health monitoring, log visualization |
 
 Both are admin/debug tools, not user-facing. Brokers interact through OpenClaw.
+
+---
+
+## OpenSearch Integration Details
+
+LightRAG provides native OpenSearch storage adapters (added March 2026). No custom adapters needed:
+
+| LightRAG Storage | OpenSearch Adapter | Purpose |
+|------------------|--------------------|---------|
+| KV Store | `OpenSearchKVStorage` | Key-value pairs for document chunks |
+| Vector Store | `OpenSearchVectorDBStorage` | Embedding vectors with k-NN search |
+| Graph Store | `OpenSearchGraphStorage` | Knowledge graph nodes and edges as documents |
+| Doc Status | `OpenSearchDocStatusStorage` | Document processing state tracking |
+
+Additionally, the system creates a `rag-logs` index for dual-write logging.
+
+Requires: OpenSearch 3.x with k-NN plugin enabled.
 
 ---
 
