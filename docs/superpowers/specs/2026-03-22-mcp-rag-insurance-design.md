@@ -265,17 +265,37 @@ PDF in inbox/ → Watchdog detects → Validate (PDF, ≤100MB)
 
 ## Query System
 
-### Query Flow
+### Retrieval Strategy
+
+LightRAG uses dual retrieval: **vector search** (semantic similarity via text-embedding-3-large embeddings) combined with **knowledge graph search** (entity relationship traversal). Results from both are merged and ranked.
+
+#### Query Modes
+
+| Mode | How It Works | Best For |
+|------|-------------|----------|
+| `local` | Searches from specific entities outward through nearby graph nodes + related chunks | Specific product queries ("AXA 智尊守慧有冇等候期？") |
+| `global` | Searches from high-level community summaries across entities | Cross-product comparisons ("邊間公司回報率最高？") |
+| `hybrid` | Combines local + global results | General questions |
+| `naive` | Pure vector search, no knowledge graph | Simple keyword-style questions |
+| `mix` | Keyword search + vector search + graph | Queries needing exact term matching |
+| `auto` (default) | System selects: hybrid for general, local for specific products, global for comparisons | All questions |
+
+#### Metadata Filtering Strategy
+
+Metadata filtering uses **pre-filtering**: metadata constraints are applied to the OpenSearch search scope **before** vector/graph retrieval runs. This is faster and appropriate because brokers typically know which company or product type they are looking for.
+
+Exception: when no filters are provided (e.g., cross-product comparison queries), the full index is searched.
 
 ```
 User question (via OpenClaw)
   → OpenClaw LLM calls MCP tool: query
-  → LightRAG processes:
+  → Pre-filter: apply metadata constraints (company, product_type, is_latest)
+     to narrow OpenSearch search scope
+  → LightRAG retrieval within filtered scope:
       1. Vector search (semantic similarity)
       2. Knowledge graph (entity relationships)
-      3. Metadata filter (company, product_type, is_latest)
-      4. Merge and rank results
-  → Return structured JSON
+      3. Merge and rank results
+  → Return structured JSON (top_k results)
   → OpenClaw LLM generates Chinese answer from context
 ```
 
