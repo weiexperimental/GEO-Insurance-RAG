@@ -329,7 +329,13 @@ When YIBU API is unavailable during ingestion:
 - **During knowledge graph construction**: Content is indexed as vector-only without graph relationships (status: `partial`). Re-ingestion rebuilds the graph.
 - **During embedding**: Ingestion is paused and retried (3 attempts). If API remains down, document stays in `pending` and watcher retries on next cycle.
 
-The `partial` status documents are fully queryable via vector search but may have degraded knowledge graph retrieval. Re-ingesting a `partial` document (same file hash) triggers re-processing instead of duplicate rejection.
+The `partial` status documents are fully queryable via vector search but may have degraded knowledge graph retrieval. Re-ingesting a `partial` document (same file hash) triggers re-processing instead of duplicate rejection. Re-processing skips version detection (document is already indexed) and only fills in missing metadata/graph data.
+
+### Concurrency Rules
+
+- **Query**: Concurrent calls allowed (OpenSearch handles concurrency)
+- **Ingestion**: Concurrent `ingest_inbox`/`ingest_document` calls are queued; only one ingestion runs at a time
+- **Document ID generation**: UUID v4, with a separate SHA-256 file hash stored for duplicate detection
 
 ---
 
@@ -345,7 +351,10 @@ Parameters:
     product_type: string          — 儲蓄/醫療/人壽/意外
     document_type: string         — 產品小冊子/宣傳單張/...
   mode: string (optional)         — auto|hybrid|local|global|naive|mix
-                                    Default: auto (system selects best mode)
+                                    Default: auto
+                                    Auto routing: hybrid for general questions,
+                                    local for specific product lookups,
+                                    global for cross-product comparisons
   top_k: int (optional)           — Number of results, default 5
   only_latest: bool (optional)    — Search latest versions only, default true
 
@@ -442,6 +451,8 @@ Returns:
     status: string
   }]
   total: int
+  limit: int
+  offset: int
 ```
 
 ### 6. `delete_document` — Delete a document from index
@@ -454,7 +465,8 @@ Parameters:
 Returns:
   success: bool
   message: string
-  knowledge_graph_updated: bool
+  knowledge_graph_updated: bool   — If false, orphan graph nodes may remain;
+                                    they are cleaned up on next ingestion cycle
 ```
 
 ### 7. `get_system_status` — System health status
@@ -476,6 +488,7 @@ Returns:
     llm: string
     embedding: string
     vision: string
+    api_status: string            — healthy|degraded|unreachable
   }
 ```
 
