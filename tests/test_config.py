@@ -39,15 +39,15 @@ def test_config_raises_on_missing_api_key():
         "LLM_MODEL": "gpt-4o-mini",
         "EMBEDDING_API_KEY": "sk-test",
         "VISION_API_KEY": "sk-test",
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", ""),
     }
-    with patch.dict(os.environ, env, clear=False):
-        import src.config
-        importlib.reload(src.config)
-        # Remove LLM_API_KEY if it exists
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("LLM_API_KEY", None)
-            with pytest.raises(ValueError, match="LLM_API_KEY"):
-                src.config.load_config()
+    import src.config
+    importlib.reload(src.config)
+    with patch.dict(os.environ, env, clear=True), \
+         patch.object(src.config, "load_dotenv"):
+        with pytest.raises(ValueError, match="LLM_API_KEY"):
+            src.config.load_config()
 
 
 def test_config_default_paths():
