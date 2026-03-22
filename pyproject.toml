@@ -1,0 +1,23 @@
+[project]
+name = "geo-insurance-rag"
+version = "0.1.0"
+description = "MCP RAG server for Hong Kong insurance product documents"
+requires-python = ">=3.12"
+dependencies = [
+    "raganything[all]>=1.2.9",
+    "mineru[mlx]>=2.7.6",
+    "fastmcp>=3.1.1",
+    "watchdog>=6.0.0",
+    "opensearch-py>=3.1.0",
+    "python-dotenv>=1.2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
