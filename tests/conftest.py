@@ -14,3 +14,7 @@ _lightrag_llm_openai_mock.openai_complete_if_cache = AsyncMock()
 sys.modules.setdefault("lightrag", _lightrag_mock)
 sys.modules.setdefault("lightrag.llm", _lightrag_llm_mock)
 sys.modules.setdefault("lightrag.llm.openai", _lightrag_llm_openai_mock)
+sys.modules.setdefault("lightrag.utils", MagicMock())
+
+# Mock raganything and its submodules
+sys.modules.setdefault("raganything", MagicMock())
