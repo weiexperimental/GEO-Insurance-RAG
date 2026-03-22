@@ -18,3 +18,7 @@ sys.modules.setdefault("lightrag.utils", MagicMock())
 
 # Mock raganything and its submodules
 sys.modules.setdefault("raganything", MagicMock())
+
+# Mock opensearchpy so server.py can import without installation
+_opensearchpy_mock = MagicMock()
+sys.modules.setdefault("opensearchpy", _opensearchpy_mock)
