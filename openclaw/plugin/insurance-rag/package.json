@@ -1,5 +1,5 @@
 {
-  "name": "insurance-rag-plugin",
+  "name": "insurance-rag",
   "version": "0.1.0",
   "type": "module",
   "openclaw": {

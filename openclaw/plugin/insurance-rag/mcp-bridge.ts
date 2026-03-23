@@ -22,10 +22,20 @@ export class McpBridge {
   ) {}
 
   async connect(): Promise<void> {
+    const basePath = process.env.PATH ?? "/usr/bin:/bin:/usr/local/bin";
+    const configEnv = this.config.env ?? {};
+
+    // If VIRTUAL_ENV is set, prepend its bin/ to PATH so venv commands
+    // (like mineru) are found. This is the key to making venv tools work
+    // when the MCP server is spawned as a child process.
+    const venvBin = configEnv.VIRTUAL_ENV
+      ? `${configEnv.VIRTUAL_ENV}/bin:`
+      : "";
+
     const safeEnv: Record<string, string> = {
-      PATH: process.env.PATH ?? "/usr/bin:/bin:/usr/local/bin",
+      PATH: `${venvBin}${basePath}`,
       HOME: process.env.HOME ?? "",
-      ...this.config.env,
+      ...configEnv,
     };
 
     this.transport = new StdioClientTransport({
