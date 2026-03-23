@@ -1,7 +1,7 @@
 # Ingestion Flow Redesign — 去 Hook、去 Watchdog、直接入庫
 
 **日期：** 2026-03-23
-**狀態：** Draft
+**狀態：** Draft (Rev 2 — 修正 spec review issues)
 
 ---
 
@@ -86,26 +86,33 @@ WhatsApp PDF:
 
 **問題：** 同一份文件可能被 enqueue 多次（heartbeat 撞車、agent 重複 call）。
 
-**方案：** `enqueue()` 前 check file path 有冇已經喺 `_doc_statuses` 入面。
+**方案：** `enqueue()` 前 check file path。用 O(1) lookup dict 而唔係 linear scan。
+
+> **注意：** Path dedup 只係 fast-path optimization，防止「heartbeat call `ingest_inbox` 兩次」嘅情況。
+> Hash dedup（喺 `_process_single` 入面）仍然係 authoritative 嘅重複檢查，覆蓋唔同路徑但相同內容嘅情況。
 
 ```python
-async def enqueue(self, file_path: str) -> dict[str, Any]:
-    # File path dedup: 如果已經 tracked 且唔係 failed，skip
-    existing = next(
-        (s for s in self._doc_statuses.values()
-         if s["file_path"] == file_path and s["status"] not in ("failed",)),
-        None
-    )
-    if existing:
-        return {
-            "document_id": existing["document_id"],
-            "status": existing["status"],
-            "duplicate": True,
-        }
+class IngestionPipeline:
+    def __init__(self, ...):
+        # ... existing fields ...
+        self._path_to_doc_id: dict[str, str] = {}  # O(1) path lookup
 
-    # 正常 enqueue
-    doc_id = str(uuid.uuid4())
-    # ... 其餘不變
+    async def enqueue(self, file_path: str) -> dict[str, Any]:
+        # Fast-path dedup: 同一個 path 唔使重複 enqueue
+        if file_path in self._path_to_doc_id:
+            existing_id = self._path_to_doc_id[file_path]
+            existing = self._doc_statuses.get(existing_id)
+            if existing and existing["status"] not in ("failed",):
+                return {
+                    "document_id": existing_id,
+                    "status": existing["status"],
+                    "duplicate": True,
+                }
+
+        # 正常 enqueue
+        doc_id = str(uuid.uuid4())
+        self._path_to_doc_id[file_path] = doc_id
+        # ... 其餘不變
 ```
 
 `failed` 狀態嘅文件允許重新 enqueue（retry）。
@@ -141,8 +148,10 @@ class IngestionPipeline:
         except Exception:
             pass  # Index 可能未存在，繼續
 
+    _persist_failures: int = 0
+
     def _persist_status(self, doc_id: str):
-        """將單個 doc status 寫入 OpenSearch。"""
+        """將單個 doc status 寫入 OpenSearch。Best-effort，唔影響主流程但會 log 錯誤。"""
         if not self._os_client:
             return
         try:
@@ -151,38 +160,86 @@ class IngestionPipeline:
                 id=doc_id,
                 body=self._doc_statuses[doc_id],
             )
-        except Exception:
-            pass  # Best-effort，唔影響主流程
+        except Exception as e:
+            self._persist_failures += 1
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Failed to persist status for {doc_id}: {e} "
+                f"(total failures: {self._persist_failures})"
+            )
 ```
 
 每次 status 變化時 call `_persist_status(doc_id)`。
+`get_system_status` 會 surface `_persist_failures` count，方便 monitoring。
+
+#### OpenSearch Index 初始化
+
+`_initialize()` 時建立 index template，確保 mapping 正確：
+
+```python
+async def _ensure_ingestion_index(client):
+    """確保 rag-ingestion-status index 存在，mapping 正確。"""
+    if not client.indices.exists("rag-ingestion-status"):
+        client.indices.create("rag-ingestion-status", body={
+            "mappings": {
+                "properties": {
+                    "document_id": {"type": "keyword"},
+                    "file_name": {"type": "keyword"},
+                    "file_path": {"type": "keyword"},
+                    "file_hash": {"type": "keyword"},
+                    "status": {"type": "keyword"},
+                    "ingested_at": {"type": "date"},
+                    "metadata": {"type": "object", "dynamic": True},
+                    "stages": {"type": "nested"},
+                }
+            }
+        })
+```
 
 ### 改動 3：`ingestion.py` — startup recovery
 
 **問題：** Server crash 喺 processing 中途，文件變孤兒。
 
-**方案：** `_load_persisted_state()` 檢查 `parsing` / `extracting_metadata` 狀態嘅文件，reset 為 `pending` 重新 enqueue。
+**方案：** 獨立嘅 `async def recover_crashed()` method，由 `server.py` 嘅 `_initialize()` 喺建構 pipeline 之後顯式 `await`。
+
+> **注意：** 唔好喺 `__init__` 或 `_load_persisted_state` 入面用 `asyncio.get_event_loop().call_soon()` — 呢個喺 sync context 入面係 unsafe 嘅。
 
 ```python
-def _load_persisted_state(self):
-    # ... load from OpenSearch ...
-
-    # Recovery: 搵出 crash 前未完成嘅文件
-    for doc_id, status in self._doc_statuses.items():
+async def recover_crashed(self):
+    """檢查 OpenSearch 入面有冇 crash 前未完成嘅文件，重新 enqueue。"""
+    recovered = []
+    for doc_id, status in list(self._doc_statuses.items()):
         if status["status"] in ("parsing", "extracting_metadata", "checking_version", "validating"):
             file_path = status["file_path"]
             if Path(file_path).exists():
                 status["status"] = "pending"
-                # Re-enqueue for processing
-                asyncio.get_event_loop().call_soon(
-                    lambda did=doc_id, fp=file_path:
-                        asyncio.create_task(self._re_enqueue(did, fp))
-                )
+                self._persist_status(doc_id)  # 即時 persist 新狀態
+                await self._queue.put((doc_id, file_path))
+                recovered.append(file_path)
+            else:
+                # 文件已經唔在，標記為 failed
+                status["status"] = "failed"
+                status["stages"].append({
+                    "stage": "recovery", "status": "failed",
+                    "duration_ms": 0, "error": "File not found after crash"
+                })
+                self._persist_status(doc_id)
+
+    if recovered:
+        asyncio.create_task(self.process_queue())
+
+    return recovered
 ```
 
-只有原始文件仲存在先會 re-enqueue（如果已經搬咗去 processed/failed 就唔理）。
+`server.py` 嘅 `_initialize()` 中：
+```python
+_pipeline = IngestionPipeline(config=_config, ...)
+recovered = await _pipeline.recover_crashed()
+if recovered:
+    print(f"Recovered {len(recovered)} crashed documents")
+```
 
-### 改動 4：`server.py` — 移除 watchdog
+### 改動 4：`server.py` — 移除 watchdog + 共享 OpenSearch client
 
 ```python
 # 刪除:
@@ -191,43 +248,97 @@ from src.watcher import InboxWatcher
 # 刪除 global:
 _watcher: InboxWatcher | None = None
 
+# 新增 global（共享 client，get_system_status 亦用）:
+_os_client: OpenSearch | None = None
+
 # 刪除 lifespan 中:
 if _watcher:
     _watcher.stop()
 
-# 刪除 _initialize() 中:
-def _on_new_file(file_path: str):
-    asyncio.create_task(_pipeline.enqueue(file_path))
-    asyncio.create_task(_pipeline.process_queue())
-
-_watcher = InboxWatcher(...)
-_watcher.start()
+# 刪除 _initialize() 中嘅 watcher 相關 code
 
 # 修改 _initialize():
-# 加入 OpenSearch client 傳入 pipeline
-from opensearchpy import OpenSearch
-client = OpenSearch(hosts=[...], use_ssl=False)
+global _os_client
+_os_client = OpenSearch(
+    hosts=[{"host": _config.opensearch.host, "port": _config.opensearch.port}],
+    use_ssl=False,
+)
+await _ensure_ingestion_index(_os_client)  # 確保 index 存在
 _pipeline = IngestionPipeline(
     config=_config,
     rag_engine=_rag_engine,
     logger=_logger,
-    opensearch_client=client,
+    opensearch_client=_os_client,
 )
+recovered = await _pipeline.recover_crashed()
 ```
+
+`get_system_status` 改用共享 `_os_client` 而唔係每次建立新 client。
 
 ### 改動 5：`server.py` — `get_system_status` 修正
 
-確保 `pending_files` count 排除已經喺 pipeline 中嘅文件：
+確保 `pending_files` count 排除已經喺 pipeline 中嘅文件。同時：
+- 用共享 `_os_client` 而唔係每次建新 client
+- 移除 `watcher_active` field
+- 新增 `persist_failures` field
 
 ```python
-# 而家：
-inbox_count = len(list(Path(_config.paths.inbox_dir).glob("*.pdf")))
+@mcp.tool
+async def get_system_status() -> dict[str, Any]:
+    os_status = "disconnected"
+    if _os_client:
+        try:
+            _os_client.info()
+            os_status = "healthy"
+        except Exception:
+            os_status = "degraded"
 
-# 改為：
-all_inbox = set(str(f) for f in Path(_config.paths.inbox_dir).glob("*.pdf"))
-tracked = set(s["file_path"] for s in _pipeline.get_all_statuses().values()
-              if s["status"] not in ("failed",))
-inbox_count = len(all_inbox - tracked)
+    inbox_count = 0
+    if _config:
+        all_inbox = set(str(f) for f in Path(_config.paths.inbox_dir).glob("*.pdf"))
+        tracked = set(s["file_path"] for s in _pipeline.get_all_statuses().values()
+                      if s["status"] not in ("failed",))
+        inbox_count = len(all_inbox - tracked)
+
+    return {
+        "opensearch": {"status": os_status, ...},
+        "inbox": {
+            "pending_files": inbox_count,
+            "heartbeat_inbox_check": True,  # 取代 watcher_active
+        },
+        "persistence": {
+            "failures": _pipeline._persist_failures if _pipeline else 0,
+        },
+        "models": {...},
+    }
+```
+
+### 改動 6：`server.py` — `ingest_inbox` 移除 pre-validation
+
+而家 `ingest_inbox` 先 `validate_file` 再 `enqueue`，但 `_process_single` 入面又 validate 一次。
+問題：pre-validation 失敗嘅文件唔會入 `_doc_statuses`，heartbeat 每次都會重試。
+
+改為：所有 validation 由 pipeline 負責，`ingest_inbox` 只負責 enqueue。
+
+```python
+@mcp.tool
+async def ingest_inbox() -> dict[str, Any]:
+    inbox = Path(_config.paths.inbox_dir)
+    files = [f for f in inbox.iterdir() if f.suffix.lower() == ".pdf"]
+
+    queued = []
+    skipped = []
+    for f in files:
+        result = await _pipeline.enqueue(str(f))
+        if result.get("duplicate"):
+            skipped.append(f.name)
+        else:
+            queued.append(f.name)
+
+    if queued:
+        asyncio.create_task(_pipeline.process_queue())
+
+    return {"queued": len(queued), "skipped": len(skipped), "files": queued}
 ```
 
 ---
@@ -316,14 +427,33 @@ rm -rf ~/.openclaw/hooks/pdf-to-inbox/
 
 ---
 
+## 測試計劃（補充）
+
+除咗 integration tests，需要新增 unit tests：
+
+| 測試 | 覆蓋 |
+|------|------|
+| `test_enqueue_path_dedup` | 同一 path enqueue 兩次，第二次 return duplicate |
+| `test_enqueue_failed_retry` | failed 狀態嘅 path 可以重新 enqueue |
+| `test_persist_status_success` | Status 變化後 OpenSearch 有對應 record |
+| `test_persist_status_failure` | OpenSearch down 時 `_persist_failures` 遞增，pipeline 繼續運作 |
+| `test_load_persisted_state` | Mock OpenSearch response，驗證 state 恢復 |
+| `test_recover_crashed_file_exists` | Crash recovery 搵到文件 → re-enqueue |
+| `test_recover_crashed_file_gone` | Crash recovery 文件唔在 → mark failed |
+| `test_ingest_inbox_no_prevalidation` | ingest_inbox 唔做 validation，交畀 pipeline |
+
+---
+
 ## 改動摘要
 
 | 文件 | 改動 |
 |------|------|
-| `src/ingestion.py` | File path dedup、OpenSearch persist、startup recovery |
-| `src/server.py` | 移除 watchdog、傳入 OpenSearch client |
-| `openclaw/katrina/AGENTS.md` | 新文件上傳流程（用 media path） |
-| `openclaw/katrina/HEARTBEAT.md` | 加 inbox 檢查 |
-| `openclaw/katrina/TOOLS.md` | 移除 watchdog 描述 |
+| `src/ingestion.py` | File path dedup (O(1) dict)、OpenSearch persist (with logging)、startup recovery (async method)、index init |
+| `src/server.py` | 移除 watchdog、共享 OpenSearch client、修正 get_system_status、ingest_inbox 移除 pre-validation |
+| `CLAUDE.md` | 移除 watchdog 出技術棧、更新 OpenSearch port 為 9200 |
+| `openclaw/katrina/AGENTS.md` | 新文件上傳流程（用 media path，唔再提 hook） |
+| `openclaw/katrina/HEARTBEAT.md` | 加 inbox 檢查（get_system_status → ingest_inbox） |
+| `openclaw/katrina/TOOLS.md` | 移除 watchdog 描述、更新上傳流程描述 |
 | `~/.openclaw/hooks/pdf-to-inbox/` | 移除 |
 | `src/watcher.py` | 保留唔刪（唔使喺 server 入面），將來可能有用 |
+| `tests/test_ingestion.py` | 新增 8 個 unit tests（dedup、persist、recovery） |
