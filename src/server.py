@@ -10,18 +10,15 @@ from contextlib import asynccontextmanager
 from fastmcp import FastMCP
 
 from src.config import load_config, AppConfig
-from src.ingestion import IngestionPipeline, validate_file, compute_file_hash
+from src.ingestion import IngestionPipeline
 from src.logging_service import RAGLogger
 from src.rag import RAGEngine
-from src.watcher import InboxWatcher
 
 
 @asynccontextmanager
 async def lifespan(server):
     await _initialize()
     yield
-    if _watcher:
-        _watcher.stop()
 
 
 mcp = FastMCP("GEO Insurance RAG", lifespan=lifespan)
@@ -31,7 +28,7 @@ _config: AppConfig | None = None
 _rag_engine: RAGEngine | None = None
 _logger: RAGLogger | None = None
 _pipeline: IngestionPipeline | None = None
-_watcher: InboxWatcher | None = None
+_os_client = None
 
 
 def _error_response(error_code: str, message: str, details: dict | None = None) -> dict:
@@ -41,6 +38,25 @@ def _error_response(error_code: str, message: str, details: dict | None = None) 
         "message": message,
         "details": details or {},
     }
+
+
+def _ensure_ingestion_index(client):
+    """Create rag-ingestion-status index if it doesn't exist."""
+    if not client.indices.exists("rag-ingestion-status"):
+        client.indices.create("rag-ingestion-status", body={
+            "mappings": {
+                "properties": {
+                    "document_id": {"type": "keyword"},
+                    "file_name": {"type": "keyword"},
+                    "file_path": {"type": "keyword"},
+                    "file_hash": {"type": "keyword"},
+                    "status": {"type": "keyword"},
+                    "ingested_at": {"type": "date"},
+                    "metadata": {"type": "object", "dynamic": True},
+                    "stages": {"type": "nested"},
+                }
+            }
+        })
 
 
 @mcp.tool
@@ -91,20 +107,16 @@ async def ingest_inbox() -> dict[str, Any]:
     queued = []
     skipped = []
     for f in files:
-        validation = validate_file(str(f), _config.limits.max_file_size_mb)
-        if validation["valid"]:
-            await _pipeline.enqueue(str(f))
-            queued.append(f.name)
-        else:
+        result = await _pipeline.enqueue(str(f))
+        if result.get("duplicate"):
             skipped.append(f.name)
+        else:
+            queued.append(f.name)
 
-    asyncio.create_task(_pipeline.process_queue())
+    if queued:
+        asyncio.create_task(_pipeline.process_queue())
 
-    return {
-        "queued": len(queued),
-        "skipped": len(skipped),
-        "files": queued,
-    }
+    return {"queued": len(queued), "skipped": len(skipped), "files": queued}
 
 
 @mcp.tool
@@ -217,21 +229,21 @@ async def get_system_status() -> dict[str, Any]:
     os_status = "disconnected"
     docs_indexed = 0
 
-    if _config:
+    if _os_client:
         try:
-            from opensearchpy import OpenSearch
-            client = OpenSearch(
-                hosts=[{"host": _config.opensearch.host, "port": _config.opensearch.port}],
-                use_ssl=False,
-            )
-            client.info()
+            _os_client.info()
             os_status = "healthy"
         except Exception:
             os_status = "degraded"
 
     inbox_count = 0
-    if _config:
-        inbox_count = len(list(Path(_config.paths.inbox_dir).glob("*.pdf")))
+    if _config and _pipeline:
+        all_inbox = set(str(f) for f in Path(_config.paths.inbox_dir).glob("*.pdf"))
+        tracked = set(
+            s["file_path"] for s in _pipeline.get_all_statuses().values()
+            if s["status"] not in ("failed",)
+        )
+        inbox_count = len(all_inbox - tracked)
 
     return {
         "opensearch": {
@@ -241,7 +253,10 @@ async def get_system_status() -> dict[str, Any]:
         },
         "inbox": {
             "pending_files": inbox_count,
-            "watcher_active": _watcher is not None,
+            "heartbeat_inbox_check": True,
+        },
+        "persistence": {
+            "failures": _pipeline._persist_failures if _pipeline else 0,
         },
         "models": {
             "llm": _config.llm.model if _config else "",
@@ -273,20 +288,20 @@ async def confirm_version_update(document_id: str, replace: bool = False) -> dic
 
 async def _initialize():
     """Initialize all components with OpenSearch health check retry."""
-    global _config, _rag_engine, _logger, _pipeline, _watcher
+    global _config, _rag_engine, _logger, _pipeline, _os_client
 
     _config = load_config()
     _logger = RAGLogger(log_dir=_config.paths.log_dir)
 
-    # OpenSearch health check: retry every 5s for 60s
     from opensearchpy import OpenSearch
+    _os_client = OpenSearch(
+        hosts=[{"host": _config.opensearch.host, "port": _config.opensearch.port}],
+        use_ssl=False,
+    )
+
     for attempt in range(12):
         try:
-            client = OpenSearch(
-                hosts=[{"host": _config.opensearch.host, "port": _config.opensearch.port}],
-                use_ssl=False,
-            )
-            client.info()
+            _os_client.info()
             break
         except Exception:
             if attempt < 11:
@@ -294,7 +309,11 @@ async def _initialize():
             else:
                 print("WARNING: OpenSearch not available, starting in degraded mode")
 
-    # Initialize RAG engine
+    try:
+        _ensure_ingestion_index(_os_client)
+    except Exception:
+        print("WARNING: Could not create ingestion index, will retry on first use")
+
     _rag_engine = RAGEngine(
         llm_config=_config.llm,
         embedding_config=_config.embedding,
@@ -307,19 +326,14 @@ async def _initialize():
     except Exception as e:
         print(f"WARNING: RAG engine init failed: {e}")
 
-    # Initialize ingestion pipeline
-    _pipeline = IngestionPipeline(config=_config, rag_engine=_rag_engine, logger=_logger)
-
-    # Start inbox watcher
-    def _on_new_file(file_path: str):
-        asyncio.create_task(_pipeline.enqueue(file_path))
-        asyncio.create_task(_pipeline.process_queue())
-
-    _watcher = InboxWatcher(
-        inbox_dir=_config.paths.inbox_dir,
-        on_new_file=_on_new_file,
+    _pipeline = IngestionPipeline(
+        config=_config, rag_engine=_rag_engine, logger=_logger,
+        opensearch_client=_os_client,
     )
-    _watcher.start()
+    recovered = await _pipeline.recover_crashed()
+    if recovered:
+        print(f"Recovered {len(recovered)} crashed documents", flush=True)
+        await _pipeline.process_queue()
 
 
 if __name__ == "__main__":
