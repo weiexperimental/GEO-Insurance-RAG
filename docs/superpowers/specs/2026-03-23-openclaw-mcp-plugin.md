@@ -94,11 +94,16 @@ class McpBridge {
 
   constructor(private config: BridgeConfig, private logger: Logger) {}
 
+  private alive: boolean = false;
+
   async connect(): Promise<void>
-  // 1. spawn python process via StdioClientTransport
-  // 2. client.connect(transport) with Promise.race timeout
-  // 3. throw if timeout exceeded
+  // 1. spawn python process via StdioClientTransport with cwd
+  // 2. set transport.onclose = () => { this.alive = false }
+  // 3. client.connect(transport) with Promise.race timeout
+  // 4. this.alive = true
+  // 5. throw if timeout exceeded
   // Env: only PATH + HOME + config.env (唔傳 process.env)
+  // cwd: config.cwd (確保 Python server 嘅 relative paths 正確)
 
   async listTools(): Promise<Tool[]>
   // client.listTools() with timeout
@@ -111,7 +116,7 @@ class McpBridge {
   // 5. return result
 
   private isAlive(): boolean
-  // transport !== null && transport 嘅 child process pid !== null
+  // return this.alive (set by transport.onclose handler)
 
   private async ensureConnected(): Promise<void>
   // Reconnect mutex:
@@ -133,18 +138,20 @@ class McpBridge {
 - **Reconnect mutex** — 只有一個 reconnect 喺 fly，其他 callers await 同一個 Promise
 - **Env isolation** — 只傳 `PATH` + `HOME` + config 指定嘅 env vars，唔 spread `process.env`
 - **Timeout everywhere** — connect (60s)、listTools (10s)、callTool (30s)
-- **Alive check by pid** — 同 Chrome MCP 一樣，唔靠 brittle string matching
+- **Alive check** — listen `transport.onclose` → set `alive = false`（唔靠 internal `pid` property）
+- **cwd** — spawn Python process 時傳 `cwd` 確保 relative paths 正確
 
 ### `index.ts` — Plugin Entry (~80 行)
 
 ```typescript
-export default function register(api: OpenClawPluginApi) {
+export default function register(api: any) {
   const config = api.pluginConfig as PluginConfig;
   const logger = api.logger;
   const bridge = new McpBridge({
     command: config.command,
     args: config.args,
     env: config.env,
+    cwd: config.cwd,
     connectTimeoutMs: config.connectTimeoutMs ?? 60000,
     callTimeoutMs: config.callTimeoutMs ?? 30000,
   }, logger);
@@ -160,18 +167,20 @@ export default function register(api: OpenClawPluginApi) {
       logger.info(`Discovered ${tools.length} tools`);
 
       for (const tool of tools) {
+        const toolName = tool.name;
         api.registerTool({
-          name: tool.name,
+          name: toolName,
+          label: toolName,  // required by AnyAgentTool
           description: tool.description ?? "",
           parameters: tool.inputSchema ?? { type: "object", properties: {} },
           async execute(_toolCallId: string, params: Record<string, unknown>) {
-            const result = await bridge.callTool(tool.name, params);
+            const result = await bridge.callTool(toolName, params);
 
             if (result.isError) {
               const errorText = result.content
                 ?.map((c: any) => c.text ?? "")
                 .join("\n") ?? "Unknown error";
-              return { content: [{ type: "text", text: errorText }] };
+              return { content: [{ type: "text", text: errorText }], details: {} };
             }
 
             const text = result.content
@@ -181,10 +190,10 @@ export default function register(api: OpenClawPluginApi) {
                 return JSON.stringify(c);
               })
               .join("\n") ?? "";
-            return { content: [{ type: "text", text }] };
+            return { content: [{ type: "text", text }], details: {} };
           },
         });
-        logger.info(`Registered tool: ${tool.name}`);
+        logger.info(`Registered tool: ${toolName}`);
       }
     },
 
@@ -196,6 +205,9 @@ export default function register(api: OpenClawPluginApi) {
   });
 }
 ```
+
+> **Note on `api: any`：** OpenClaw 唔 export plugin API types 畀外部用。同現有 plugins（tlon、lobster）一樣用 `any`。
+> Runtime 會驗證 `registerTool` 嘅 shape 係咪正確。
 
 **Key design decisions：**
 - **Tool names 直接用 MCP server 嘅** — 唔加 prefix（只有一個 server）
@@ -228,6 +240,10 @@ export default function register(api: OpenClawPluginApi) {
         "type": "object",
         "additionalProperties": { "type": "string" },
         "description": "Environment variables for the MCP server"
+      },
+      "cwd": {
+        "type": "string",
+        "description": "Working directory for the MCP server process"
       },
       "connectTimeoutMs": {
         "type": "number",
@@ -286,6 +302,7 @@ export default function register(api: OpenClawPluginApi) {
           "env": {
             "PYTHONPATH": "/Users/weiexperimental/Desktop/GEO-Insurance-RAG"
           },
+          "cwd": "/Users/weiexperimental/Desktop/GEO-Insurance-RAG",
           "connectTimeoutMs": 60000,
           "callTimeoutMs": 30000
         }
