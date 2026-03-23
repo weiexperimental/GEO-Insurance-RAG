@@ -88,13 +88,43 @@ class RAGEngine:
             )
 
         async def vision_func(prompt, system_prompt=None, history_messages=None, **kw):
-            return await _llm_func(
-                prompt, system_prompt, history_messages,
-                model=self._vision_cfg.model,
-                api_key=self._vision_cfg.api_key,
-                base_url=self._vision_cfg.api_base,
-                **kw,
-            )
+            image_data = kw.pop("image_data", None)
+            if image_data:
+                # RAG-Anything passes base64 image via image_data kwarg.
+                # Convert to OpenAI vision format: messages with content array.
+                from openai import AsyncOpenAI
+                client = AsyncOpenAI(
+                    api_key=self._vision_cfg.api_key,
+                    base_url=self._vision_cfg.api_base,
+                )
+                messages = []
+                if system_prompt:
+                    messages.append({"role": "system", "content": system_prompt})
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_data}"
+                            },
+                        },
+                    ],
+                })
+                response = await client.chat.completions.create(
+                    model=self._vision_cfg.model,
+                    messages=messages,
+                )
+                return response.choices[0].message.content
+            else:
+                return await _llm_func(
+                    prompt, system_prompt, history_messages,
+                    model=self._vision_cfg.model,
+                    api_key=self._vision_cfg.api_key,
+                    base_url=self._vision_cfg.api_base,
+                    **kw,
+                )
 
         self._lightrag = LightRAG(
             working_dir=self._working_dir,
