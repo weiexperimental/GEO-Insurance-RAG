@@ -98,3 +98,97 @@ def test_compute_file_hash():
         h = compute_file_hash(f.name)
         expected = hashlib.sha256(b"test content for hashing").hexdigest()
         assert h == expected
+
+
+@pytest.fixture
+def mock_os_client():
+    """Mock OpenSearch client."""
+    from unittest.mock import MagicMock
+    client = MagicMock()
+    client.index = MagicMock()
+    client.search = MagicMock(return_value={"hits": {"hits": []}})
+    client.indices = MagicMock()
+    client.indices.exists = MagicMock(return_value=True)
+    return client
+
+
+@pytest.fixture
+def pipeline_with_os(tmp_path, mock_os_client):
+    """Pipeline with OpenSearch client."""
+    from unittest.mock import MagicMock
+    from src.ingestion import IngestionPipeline
+    config = MagicMock()
+    config.limits.max_file_size_mb = 100
+    config.paths.inbox_dir = str(tmp_path / "inbox")
+    config.paths.processed_dir = str(tmp_path / "processed")
+    config.paths.failed_dir = str(tmp_path / "failed")
+    for d in ["inbox", "processed", "failed"]:
+        (tmp_path / d).mkdir()
+    return IngestionPipeline(config=config, rag_engine=MagicMock(), logger=MagicMock(), opensearch_client=mock_os_client)
+
+
+@pytest.mark.asyncio
+async def test_persist_status_success(pipeline_with_os, mock_os_client, tmp_path):
+    """Status changes are persisted to OpenSearch."""
+    pdf = tmp_path / "inbox" / "persist.pdf"
+    pdf.write_bytes(b"%PDF-1.4 test")
+    result = await pipeline_with_os.enqueue(str(pdf))
+    doc_id = result["document_id"]
+    mock_os_client.index.assert_called()
+    call_args = mock_os_client.index.call_args
+    assert call_args.kwargs["index"] == "rag-ingestion-status"
+    assert call_args.kwargs["id"] == doc_id
+
+
+@pytest.mark.asyncio
+async def test_persist_status_failure_increments_counter(tmp_path):
+    """OpenSearch failure increments counter but doesn't crash pipeline."""
+    from unittest.mock import MagicMock
+    from src.ingestion import IngestionPipeline
+    os_client = MagicMock()
+    os_client.index = MagicMock(side_effect=Exception("OS down"))
+    os_client.search = MagicMock(return_value={"hits": {"hits": []}})
+    os_client.indices = MagicMock()
+    os_client.indices.exists = MagicMock(return_value=True)
+    config = MagicMock()
+    config.limits.max_file_size_mb = 100
+    config.paths.inbox_dir = str(tmp_path / "inbox")
+    config.paths.processed_dir = str(tmp_path / "processed")
+    config.paths.failed_dir = str(tmp_path / "failed")
+    for d in ["inbox", "processed", "failed"]:
+        (tmp_path / d).mkdir()
+    pipeline = IngestionPipeline(config=config, rag_engine=MagicMock(), logger=MagicMock(), opensearch_client=os_client)
+    pdf = tmp_path / "inbox" / "fail.pdf"
+    pdf.write_bytes(b"%PDF-1.4 test")
+    result = await pipeline.enqueue(str(pdf))
+    assert result["status"] == "pending"
+    assert pipeline._persist_failures >= 1
+
+
+@pytest.mark.asyncio
+async def test_load_persisted_state(tmp_path):
+    """Pipeline loads existing state from OpenSearch on init."""
+    from unittest.mock import MagicMock
+    from src.ingestion import IngestionPipeline
+    os_client = MagicMock()
+    os_client.search = MagicMock(return_value={
+        "hits": {"hits": [{"_source": {
+            "document_id": "doc-123", "file_name": "test.pdf",
+            "file_path": "/some/path/test.pdf", "file_hash": "abc123",
+            "status": "ready", "stages": [], "metadata": {}, "ingested_at": "2026-03-23T00:00:00Z",
+        }}]}
+    })
+    os_client.index = MagicMock()
+    os_client.indices = MagicMock()
+    os_client.indices.exists = MagicMock(return_value=True)
+    config = MagicMock()
+    config.limits.max_file_size_mb = 100
+    config.paths.inbox_dir = str(tmp_path / "inbox")
+    config.paths.processed_dir = str(tmp_path / "processed")
+    config.paths.failed_dir = str(tmp_path / "failed")
+    for d in ["inbox", "processed", "failed"]:
+        (tmp_path / d).mkdir()
+    pipeline = IngestionPipeline(config=config, rag_engine=MagicMock(), logger=MagicMock(), opensearch_client=os_client)
+    assert "doc-123" in pipeline._doc_statuses
+    assert "abc123" in pipeline._known_hashes
+    assert "/some/path/test.pdf" in pipeline._path_to_doc_id

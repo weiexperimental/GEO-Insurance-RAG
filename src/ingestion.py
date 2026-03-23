@@ -1,11 +1,14 @@
 # src/ingestion.py
 import asyncio
 import hashlib
+import logging
 import shutil
 import time
 import uuid
 from pathlib import Path
 from typing import Any
+
+_logger_mod = logging.getLogger(__name__)
 
 from src.config import AppConfig
 from src.logging_service import RAGLogger
@@ -83,6 +86,43 @@ class IngestionPipeline:
         self._path_to_doc_id: dict[str, str] = {}
         self._persist_failures: int = 0
 
+        if self._os_client:
+            self._load_persisted_state()
+
+    def _load_persisted_state(self):
+        """Load existing doc statuses from OpenSearch."""
+        try:
+            resp = self._os_client.search(
+                index="rag-ingestion-status",
+                body={"query": {"match_all": {}}, "size": 10000},
+            )
+            for hit in resp["hits"]["hits"]:
+                doc = hit["_source"]
+                self._doc_statuses[doc["document_id"]] = doc
+                if doc.get("file_hash"):
+                    self._known_hashes.add(doc["file_hash"])
+                if doc.get("file_path"):
+                    self._path_to_doc_id[doc["file_path"]] = doc["document_id"]
+        except Exception as e:
+            _logger_mod.warning("Failed to load persisted state: %s", e)
+
+    def _persist_status(self, doc_id: str):
+        """Write a single doc status to OpenSearch. Best-effort with logging."""
+        if not self._os_client:
+            return
+        try:
+            self._os_client.index(
+                index="rag-ingestion-status",
+                id=doc_id,
+                body=self._doc_statuses[doc_id],
+            )
+        except Exception as e:
+            self._persist_failures += 1
+            _logger_mod.warning(
+                "Failed to persist status for %s: %s (total failures: %d)",
+                doc_id, e, self._persist_failures,
+            )
+
     def get_status(self, document_id: str) -> dict | None:
         return self._doc_statuses.get(document_id)
 
@@ -114,6 +154,7 @@ class IngestionPipeline:
             "file_hash": None,
             "ingested_at": None,
         }
+        self._persist_status(doc_id)
         await self._queue.put((doc_id, file_path))
         return {"document_id": doc_id, "status": "pending"}
 
@@ -138,6 +179,7 @@ class IngestionPipeline:
 
         if not validation["valid"]:
             status["status"] = "failed"
+            self._persist_status(doc_id)
             shutil.move(file_path, str(Path(self._config.paths.failed_dir) / file_name))
             self._logger.log(document=file_name, stage="validating", status="failed", details={"reason": validation["reason"]})
             return
@@ -152,6 +194,7 @@ class IngestionPipeline:
                 is_reprocess = True
             elif existing:
                 status["status"] = "failed"
+                self._persist_status(doc_id)
                 status["stages"].append({"stage": "duplicate_check", "status": "skipped", "duration_ms": 0, "error": "Duplicate file"})
                 self._logger.log(document=file_name, stage="duplicate_check", status="skipped", details={"reason": "duplicate"})
                 return
@@ -160,6 +203,7 @@ class IngestionPipeline:
 
         # Stage: parsing (with retry)
         status["status"] = "parsing"
+        self._persist_status(doc_id)
         start = time.time()
         try:
             await _retry_async(lambda: self._rag.ingest_document(
@@ -175,6 +219,7 @@ class IngestionPipeline:
             elapsed = int((time.time() - start) * 1000)
             status["stages"].append({"stage": "parsing", "status": "failed", "duration_ms": elapsed, "error": str(e)})
             status["status"] = "failed"
+            self._persist_status(doc_id)
             shutil.move(file_path, str(Path(self._config.paths.failed_dir) / file_name))
             self._logger.log(document=file_name, stage="parsing", status="failed", duration_ms=elapsed, details={"error": str(e)})
             return
@@ -198,6 +243,7 @@ class IngestionPipeline:
             status["stages"].append({"stage": "extracting_metadata", "status": "failed", "duration_ms": elapsed, "error": "Metadata extraction failed"})
             status["status"] = "partial"
             status["ingested_at"] = datetime.now(timezone.utc).isoformat()
+            self._persist_status(doc_id)
             self._logger.log(document=file_name, stage="extracting_metadata", status="failed", duration_ms=elapsed)
             shutil.move(file_path, str(Path(self._config.paths.processed_dir) / file_name))
             return
@@ -210,6 +256,7 @@ class IngestionPipeline:
             match = find_existing_version(metadata, [s.get("metadata", {}) | {"document_id": s["document_id"]} for s in existing_docs if s.get("metadata")])
             if match:
                 status["status"] = "awaiting_confirmation"
+                self._persist_status(doc_id)
                 status["stages"].append({"stage": "checking_version", "status": "awaiting_confirmation", "duration_ms": 0, "error": None})
                 status["metadata"]["_matched_doc_id"] = match["document_id"]
                 self._logger.log(document=file_name, stage="checking_version", status="awaiting_confirmation",
@@ -222,5 +269,6 @@ class IngestionPipeline:
         status["status"] = "ready"
         status["metadata"]["is_latest"] = True
         status["ingested_at"] = datetime.now(timezone.utc).isoformat()
+        self._persist_status(doc_id)
         shutil.move(file_path, str(Path(self._config.paths.processed_dir) / file_name))
         self._logger.log(document=file_name, stage="complete", status="success")
