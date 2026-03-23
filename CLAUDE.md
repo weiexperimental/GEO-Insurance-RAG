@@ -12,7 +12,7 @@
 - **OpenSearch 3.x** — 統一儲存（vector、graph、KV、doc status）
 - **FastMCP 3.x** — MCP server framework
 - **YIBU API** — LLM/embedding/vision provider（OpenAI 兼容）
-- **watchdog** — inbox 資料夾即時監察
+- **OpenClaw heartbeat** — 定期 inbox 檢查 + 入庫狀態通知
 
 ## 關鍵設計決定
 
@@ -21,7 +21,7 @@
 - MinerU 語言：`lang="ch"`（中文 OCR）
 - Embedding：`text-embedding-3-large`（3072 維度）
 - 內部 LLM + Vision：`gpt-4o-mini` via YIBU API
-- OpenSearch port：**9201**（避開現有 9200 佔用）
+- OpenSearch port：**9200**（預設）
 - MCP 傳輸：stdio + Streamable HTTP
 - 入庫：逐份順序處理，3 次 retry + exponential backoff
 - 版本管理：保留舊版標記過時，自動配對 + 用戶確認
