@@ -53,9 +53,16 @@ async def _retry_async(coro_factory, retries=3, delays=RETRY_DELAYS):
 
 
 def _read_parsed_content(output_dir: str, file_name: str) -> str:
-    """Read the markdown output from MinerU parsing."""
+    """Read the markdown output from MinerU parsing.
+    MinerU saves to: {output_dir}/{stem}/hybrid_auto/{stem}.md"""
     stem = Path(file_name).stem
-    for pattern in [f"{stem}/{stem}.md", f"{stem}.md", f"{stem}/auto/{stem}.md"]:
+    patterns = [
+        f"{stem}/hybrid_auto/{stem}.md",
+        f"{stem}/auto/{stem}.md",
+        f"{stem}/{stem}.md",
+        f"{stem}.md",
+    ]
+    for pattern in patterns:
         md_path = Path(output_dir) / pattern
         if md_path.exists():
             return md_path.read_text(encoding="utf-8")
