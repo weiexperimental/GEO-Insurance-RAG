@@ -192,3 +192,74 @@ async def test_load_persisted_state(tmp_path):
     assert "doc-123" in pipeline._doc_statuses
     assert "abc123" in pipeline._known_hashes
     assert "/some/path/test.pdf" in pipeline._path_to_doc_id
+
+
+@pytest.mark.asyncio
+async def test_recover_crashed_file_exists(tmp_path):
+    """Recovery re-enqueues documents stuck in processing state."""
+    from unittest.mock import MagicMock
+    from src.ingestion import IngestionPipeline
+
+    orphan_path = tmp_path / "inbox" / "orphan.pdf"
+    orphan_path.parent.mkdir(exist_ok=True)
+    orphan_path.write_bytes(b"%PDF-1.4 orphan")
+
+    os_client = MagicMock()
+    os_client.search = MagicMock(return_value={
+        "hits": {"hits": [{"_source": {
+            "document_id": "orphan-1", "file_name": "orphan.pdf",
+            "file_path": str(orphan_path), "file_hash": None,
+            "status": "parsing", "stages": [], "metadata": None, "ingested_at": None,
+        }}]}
+    })
+    os_client.index = MagicMock()
+    os_client.indices = MagicMock()
+    os_client.indices.exists = MagicMock(return_value=True)
+
+    config = MagicMock()
+    config.limits.max_file_size_mb = 100
+    config.paths.inbox_dir = str(tmp_path / "inbox")
+    config.paths.processed_dir = str(tmp_path / "processed")
+    config.paths.failed_dir = str(tmp_path / "failed")
+    for d in ["inbox", "processed", "failed"]:
+        (tmp_path / d).mkdir(exist_ok=True)
+
+    pipeline = IngestionPipeline(config=config, rag_engine=MagicMock(), logger=MagicMock(), opensearch_client=os_client)
+
+    recovered = await pipeline.recover_crashed()
+    assert len(recovered) == 1
+    assert str(orphan_path) in recovered
+    assert pipeline._doc_statuses["orphan-1"]["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_recover_crashed_file_gone(tmp_path):
+    """Recovery marks missing files as failed."""
+    from unittest.mock import MagicMock
+    from src.ingestion import IngestionPipeline
+
+    os_client = MagicMock()
+    os_client.search = MagicMock(return_value={
+        "hits": {"hits": [{"_source": {
+            "document_id": "gone-1", "file_name": "gone.pdf",
+            "file_path": "/nonexistent/gone.pdf", "file_hash": None,
+            "status": "extracting_metadata", "stages": [], "metadata": None, "ingested_at": None,
+        }}]}
+    })
+    os_client.index = MagicMock()
+    os_client.indices = MagicMock()
+    os_client.indices.exists = MagicMock(return_value=True)
+
+    config = MagicMock()
+    config.limits.max_file_size_mb = 100
+    config.paths.inbox_dir = str(tmp_path / "inbox")
+    config.paths.processed_dir = str(tmp_path / "processed")
+    config.paths.failed_dir = str(tmp_path / "failed")
+    for d in ["inbox", "processed", "failed"]:
+        (tmp_path / d).mkdir(exist_ok=True)
+
+    pipeline = IngestionPipeline(config=config, rag_engine=MagicMock(), logger=MagicMock(), opensearch_client=os_client)
+
+    recovered = await pipeline.recover_crashed()
+    assert len(recovered) == 0
+    assert pipeline._doc_statuses["gone-1"]["status"] == "failed"

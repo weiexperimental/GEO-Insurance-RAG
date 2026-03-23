@@ -272,3 +272,30 @@ class IngestionPipeline:
         self._persist_status(doc_id)
         shutil.move(file_path, str(Path(self._config.paths.processed_dir) / file_name))
         self._logger.log(document=file_name, stage="complete", status="success")
+
+    async def recover_crashed(self) -> list[str]:
+        """Re-enqueue documents stuck in processing state after a crash."""
+        in_progress_states = ("parsing", "extracting_metadata", "checking_version", "validating")
+        recovered = []
+
+        for doc_id, status in list(self._doc_statuses.items()):
+            if status["status"] not in in_progress_states:
+                continue
+
+            file_path = status["file_path"]
+            if Path(file_path).exists():
+                status["status"] = "pending"
+                self._persist_status(doc_id)
+                await self._queue.put((doc_id, file_path))
+                recovered.append(file_path)
+            else:
+                status["status"] = "failed"
+                status["stages"].append({
+                    "stage": "recovery",
+                    "status": "failed",
+                    "duration_ms": 0,
+                    "error": "File not found after crash",
+                })
+                self._persist_status(doc_id)
+
+        return recovered
