@@ -1,0 +1,39 @@
+{
+  "id": "insurance-rag",
+  "name": "Insurance RAG",
+  "description": "Bridge to insurance document RAG MCP server",
+  "configSchema": {
+    "type": "object",
+    "required": ["command"],
+    "properties": {
+      "command": {
+        "type": "string",
+        "description": "Python executable path"
+      },
+      "args": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Arguments (e.g. path to server.py)"
+      },
+      "env": {
+        "type": "object",
+        "additionalProperties": { "type": "string" },
+        "description": "Environment variables for the MCP server"
+      },
+      "cwd": {
+        "type": "string",
+        "description": "Working directory for the MCP server process"
+      },
+      "connectTimeoutMs": {
+        "type": "number",
+        "default": 60000,
+        "description": "Connection timeout in milliseconds"
+      },
+      "callTimeoutMs": {
+        "type": "number",
+        "default": 30000,
+        "description": "Per-tool-call timeout in milliseconds"
+      }
+    }
+  }
+}

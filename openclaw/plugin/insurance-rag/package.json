@@ -1,0 +1,11 @@
+{
+  "name": "insurance-rag-plugin",
+  "version": "0.1.0",
+  "type": "module",
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.0"
+  }
+}
