@@ -190,7 +190,7 @@ class IngestionPipeline:
 
         if file_hash in self._known_hashes:
             existing = next((s for s in self._doc_statuses.values() if s.get("file_hash") == file_hash and s["document_id"] != doc_id), None)
-            if existing and existing.get("status") == "partial":
+            if existing and existing.get("status") in ("partial", "failed"):
                 is_reprocess = True
             elif existing:
                 status["status"] = "failed"
