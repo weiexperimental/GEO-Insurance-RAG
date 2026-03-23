@@ -12,7 +12,7 @@
 - **OpenSearch 3.x** — 統一儲存（vector、graph、KV、doc status）
 - **FastMCP 3.x** — MCP server framework
 - **YIBU API** — LLM/embedding/vision provider（OpenAI 兼容）
-- **OpenClaw heartbeat** — 定期 inbox 檢查 + 入庫狀態通知
+- **watchdog** — inbox 資料夾即時監察
 
 ## 關鍵設計決定
 
@@ -73,6 +73,23 @@ PYTHONPATH=. python src/server.py
   }
 }
 ```
+
+## OpenClaw Plugin 架構（重要）
+
+OpenClaw plugin 嘅 `register()` 函數係同步執行嘅。Plugin registry 有多個獨立 cache
+（gateway-cli、model-selection、reply 各自有自己嘅 `registryCache` Map）。每次
+agent 處理訊息時都會重新 `loadOpenClawPlugins()`，如果 cache miss 就只會執行
+`register()` — 唔會執行 `service.start()`。
+
+**關鍵規則：所有 `api.registerTool()` 必須喺 `register()` 入面同步調用。**
+唔好喺 `service.start()` 入面註冊 tool，因為嗰度嘅 tool 只會出現喺 gateway 嘅
+cache 入面，agent 嘅 cache 永遠見唔到。
+
+解決方案：將 tool 定義寫死（static），喺 `register()` 入面同步註冊，MCP bridge
+用 lazy-connect 模式（第一次 tool call 先連接）。Service 只負責 eager connect 同
+shutdown。
+
+Plugin 源碼位置：`~/.openclaw/extensions/insurance-rag/index.ts`
 
 ## 用戶偏好
 
