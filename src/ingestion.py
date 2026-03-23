@@ -70,14 +70,18 @@ def _read_parsed_content(output_dir: str, file_name: str) -> str:
 
 
 class IngestionPipeline:
-    def __init__(self, config: AppConfig, rag_engine: RAGEngine, logger: RAGLogger):
+    def __init__(self, config: AppConfig, rag_engine: RAGEngine, logger: RAGLogger,
+                 opensearch_client=None):
         self._config = config
         self._rag = rag_engine
         self._logger = logger
+        self._os_client = opensearch_client
         self._queue: asyncio.Queue = asyncio.Queue()
         self._lock = asyncio.Lock()
         self._doc_statuses: dict[str, dict] = {}
         self._known_hashes: set[str] = set()
+        self._path_to_doc_id: dict[str, str] = {}
+        self._persist_failures: int = 0
 
     def get_status(self, document_id: str) -> dict | None:
         return self._doc_statuses.get(document_id)
@@ -86,7 +90,20 @@ class IngestionPipeline:
         return dict(self._doc_statuses)
 
     async def enqueue(self, file_path: str) -> dict[str, Any]:
+        file_path = str(Path(file_path).resolve())
+
+        if file_path in self._path_to_doc_id:
+            existing_id = self._path_to_doc_id[file_path]
+            existing = self._doc_statuses.get(existing_id)
+            if existing and existing["status"] not in ("failed",):
+                return {
+                    "document_id": existing_id,
+                    "status": existing["status"],
+                    "duplicate": True,
+                }
+
         doc_id = str(uuid.uuid4())
+        self._path_to_doc_id[file_path] = doc_id
         self._doc_statuses[doc_id] = {
             "document_id": doc_id,
             "file_name": Path(file_path).name,
