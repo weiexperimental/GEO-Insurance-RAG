@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from contextlib import asynccontextmanager
+
 from fastmcp import FastMCP
 
 from src.config import load_config, AppConfig
@@ -13,7 +15,16 @@ from src.logging_service import RAGLogger
 from src.rag import RAGEngine
 from src.watcher import InboxWatcher
 
-mcp = FastMCP("GEO Insurance RAG")
+
+@asynccontextmanager
+async def lifespan(server):
+    await _initialize()
+    yield
+    if _watcher:
+        _watcher.stop()
+
+
+mcp = FastMCP("GEO Insurance RAG", lifespan=lifespan)
 
 # Global state (initialized on startup)
 _config: AppConfig | None = None
@@ -312,5 +323,4 @@ async def _initialize():
 
 
 if __name__ == "__main__":
-    _config = load_config()
     mcp.run()
