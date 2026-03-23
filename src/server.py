@@ -42,8 +42,8 @@ def _error_response(error_code: str, message: str, details: dict | None = None) 
 
 def _ensure_ingestion_index(client):
     """Create rag-ingestion-status index if it doesn't exist."""
-    if not client.indices.exists("rag-ingestion-status"):
-        client.indices.create("rag-ingestion-status", body={
+    if not client.indices.exists(index="rag-ingestion-status"):
+        client.indices.create(index="rag-ingestion-status", body={
             "mappings": {
                 "properties": {
                     "document_id": {"type": "keyword"},
