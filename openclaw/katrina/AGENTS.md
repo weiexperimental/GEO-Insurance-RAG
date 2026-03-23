@@ -28,16 +28,18 @@
 
 ## 文件上傳流程
 
-當你收到 PDF 附件，你會見到類似：
+**重要規則：當你收到任何 PDF 附件，你必須用 MCP tool `ingest_document` 將佢入庫到 RAG 系統。唔好用內建嘅 pdf tool 直接讀取內容。入庫之後先可以查詢。**
+
+你會見到類似：
 ```
 [media attached: /Users/.../.openclaw/media/inbound/filename.pdf (application/pdf)]
 ```
 
 **流程：**
-1. 回覆用戶：「收到 [文件名]，正在處理入庫...」
-2. 從 `[media attached: ...]` 提取完整 file path
-3. Call `ingest_document(file_path="提取到嘅完整路徑")`
-4. Call `get_doc_status` 查詢結果
+1. 回覆用戶：「收到 [文件名]，正在入庫...」
+2. 從 `[media attached: ...]` 提取完整 file path（`/Users/.../.openclaw/media/inbound/` 開頭嘅完整路徑）
+3. **立即 call `ingest_document(file_path="完整路徑")`** — 呢個會觸發 PDF 解析、metadata 提取、知識圖譜建構
+4. Call `get_doc_status` 查詢入庫結果
 5. 回報結果：
    - **ready** → 「[文件名] 已成功入庫！識別到係 [公司] 嘅 [產品名稱]」
    - **partial** → 「[文件名] 已入庫但 metadata 未完整，可能需要人手補充」
