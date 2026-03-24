@@ -39,6 +39,13 @@ class LimitsConfig:
 
 
 @dataclass
+class CallbackConfig:
+    hooks_token: str
+    gateway_port: int
+    notify_to: str
+
+
+@dataclass
 class AppConfig:
     llm: ModelConfig
     embedding: ModelConfig
@@ -47,6 +54,7 @@ class AppConfig:
     mineru: MinerUConfig
     paths: PathsConfig
     limits: LimitsConfig
+    callback: CallbackConfig
 
 
 def _require_env(key: str) -> str:
@@ -92,5 +100,10 @@ def load_config() -> AppConfig:
         ),
         limits=LimitsConfig(
             max_file_size_mb=int(os.getenv("MAX_FILE_SIZE_MB", "100")),
+        ),
+        callback=CallbackConfig(
+            hooks_token=os.getenv("OPENCLAW_HOOKS_TOKEN", ""),
+            gateway_port=int(os.getenv("OPENCLAW_GATEWAY_PORT", "18789")),
+            notify_to=os.getenv("OPENCLAW_NOTIFY_TO", ""),
         ),
     )

@@ -62,3 +62,34 @@ def test_config_default_paths():
         cfg = src.config.load_config()
         assert "inbox" in cfg.paths.inbox_dir
         assert cfg.limits.max_file_size_mb == 100
+
+
+def test_config_has_callback_fields(monkeypatch):
+    """Config loads callback fields from env vars."""
+    from src.config import load_config
+    monkeypatch.setenv("LLM_API_KEY", "test")
+    monkeypatch.setenv("EMBEDDING_API_KEY", "test")
+    monkeypatch.setenv("VISION_API_KEY", "test")
+    monkeypatch.setenv("OPENCLAW_HOOKS_TOKEN", "test-token")
+    monkeypatch.setenv("OPENCLAW_GATEWAY_PORT", "18789")
+    monkeypatch.setenv("OPENCLAW_NOTIFY_TO", "+1234567890")
+    with monkeypatch.context() as m:
+        m.setattr("src.config.load_dotenv", lambda: None)
+        config = load_config()
+    assert config.callback.hooks_token == "test-token"
+    assert config.callback.gateway_port == 18789
+    assert config.callback.notify_to == "+1234567890"
+
+
+def test_config_callback_defaults(monkeypatch):
+    """Callback fields have sensible defaults (all optional)."""
+    from src.config import load_config
+    monkeypatch.setenv("LLM_API_KEY", "test")
+    monkeypatch.setenv("EMBEDDING_API_KEY", "test")
+    monkeypatch.setenv("VISION_API_KEY", "test")
+    with monkeypatch.context() as m:
+        m.setattr("src.config.load_dotenv", lambda: None)
+        config = load_config()
+    assert config.callback.hooks_token == ""
+    assert config.callback.gateway_port == 18789
+    assert config.callback.notify_to == ""
