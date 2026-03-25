@@ -54,23 +54,35 @@ cp openclaw/katrina/USER.md ~/.openclaw/workspace/USER.md
 
 ---
 
-## 第二步：安裝 PDF 自動入庫 Hook
+## 第二步：原理
 
-### 背景
-
-OpenClaw 收到 WhatsApp 傳嚟嘅文件會存喺臨時目錄（`/tmp/openclaw/`），唔會自動搬去 RAG pipeline 嘅 inbox。呢個 hook 解決呢個問題。
-
-### 原理
+### PDF 入庫流程
 
 ```
 WhatsApp 發 PDF
-    → OpenClaw 收到，存入臨時目錄
-    → 觸發 message:preprocessed event
-    → pdf-to-inbox hook 檢查 mediaType === "application/pdf"
-    → 自動 copy 去 data/inbox/
-    → watchdog 偵測到新文件，觸發入庫 pipeline
-    → heartbeat 定期 check 狀態，通知用戶結果
+    → OpenClaw 收到，存入 ~/.openclaw/media/inbound/
+    → Katrina 收到訊息，提取 file_path
+    → Katrina call ingest(file_path)
+    → MinerU 解析 → LightRAG 入庫 → metadata 提取
+    → 文件搬去 data/processed/
+    → Gateway callback 通知 Katrina → Katrina 通知用戶
+
+手動放 PDF 入 data/inbox/
+    → Heartbeat（每 5 分鐘）偵測到 inbox 有文件
+    → Katrina call ingest_all
+    → 同上流程
 ```
+
+---
+
+## 第三步（可選）：安裝 PDF 自動 Copy Hook
+
+> **可選 — 只喺需要自動 copy 文件去 inbox 時先裝。**
+> 如果你只係用 WhatsApp 直接發 PDF 畀 Katrina，或者手動放文件入 `data/inbox/`，唔需要裝呢個 hook。
+
+### 背景
+
+如果你想將其他來源嘅 PDF 自動 copy 入 `data/inbox/`（例如透過 OpenClaw hook 事件），可以安裝呢個 hook。
 
 ### 安裝步驟
 
@@ -117,7 +129,7 @@ openclaw hooks list
 
 ---
 
-## 第三步：啟動 OpenSearch
+## 第四步：啟動 OpenSearch
 
 RAG pipeline 嘅核心儲存，冇佢乜都做唔到。
 
@@ -151,7 +163,7 @@ docker ps                                               # 查看狀態
 
 ---
 
-## 第四步：配置 MCP Server
+## 第五步：配置 MCP Server
 
 喺 `~/.openclaw/openclaw.json` 加入 MCP server 設定：
 
@@ -177,10 +189,10 @@ docker ps                                               # 查看狀態
 
 全部做完之後，逐個驗證：
 
-- [ ] `openclaw hooks list` 顯示 `pdf-to-inbox` 係 `✓ ready`
 - [ ] 喺 WhatsApp send 一份 PDF 畀 Katrina
-- [ ] 檢查 `data/inbox/` 有冇出現該 PDF
-- [ ] 檢查入庫結果：Katrina 應該會喺下次 heartbeat 通知你
+- [ ] Katrina 確認收到並開始入庫
+- [ ] 入庫完成後 Katrina 通知你結果
+- [ ] 用 `list_documents` 確認文件已入庫
 - [ ] 試問 Katrina 一個保險問題，確認 `query` tool 正常運作
 
 ---
@@ -189,8 +201,8 @@ docker ps                                               # 查看狀態
 
 | 問題 | 檢查 |
 |------|------|
-| Hook 冇觸發 | `openclaw hooks list` 確認 enabled；重啟 gateway |
-| PDF 冇出現喺 inbox | 檢查 handler.ts 入面嘅 INBOX_DIR 路徑係咪正確 |
-| 入庫失敗 | 檢查 `data/failed/` 有冇文件；用 `get_doc_status` 查原因 |
+| Hook 冇觸發（如已安裝） | `openclaw hooks list` 確認 enabled；重啟 gateway |
+| PDF 冇出現喺 inbox（如已安裝 hook） | 檢查 handler.ts 入面嘅 INBOX_DIR 路徑係咪正確 |
+| 入庫失敗 | 檢查 `data/failed/` 有冇文件；用 `list_documents` 查狀態 |
 | Katrina 冇反應 | 檢查 MCP server 設定；確認 OpenSearch 有冇跑緊 |
-| Heartbeat 冇通知 | 確認 HEARTBEAT.md 已複製去 workspace 且唔係空白 |
+| OpenSearch 起唔到 | 確認 Docker Desktop 有冇跑緊；檢查 port 9200 有冇被佔用 |

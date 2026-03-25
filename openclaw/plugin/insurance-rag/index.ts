@@ -16,44 +16,30 @@ interface ToolDef {
   inputSchema?: Record<string, unknown>;
 }
 
-// Default tool definitions matching the MCP server's 8 tools.
+// Default tool definitions matching the MCP server's 6 tools.
 // These are declared statically so registerTool() can run synchronously
 // inside register().  The actual MCP bridge connects lazily on first call.
 const DEFAULT_TOOLS: ToolDef[] = [
   {
     name: "query",
     description:
-      "Search insurance product information using semantic search and knowledge graph. Supports filtering by company, product_type, document_type.",
+      "Search insurance product information using semantic search and knowledge graph.",
     inputSchema: {
       type: "object",
       properties: {
         question: { type: "string", description: "The question to search for" },
-        filters: {
-          type: "object",
-          description: "Optional filters (company, product_type, document_type)",
-        },
         mode: {
           type: "string",
           description: "Search mode: auto, hybrid, local, global, naive",
           default: "auto",
         },
         top_k: { type: "number", description: "Number of results", default: 5 },
-        only_latest: {
-          type: "boolean",
-          description: "Only return latest version of documents",
-          default: true,
-        },
       },
       required: ["question"],
     },
   },
   {
-    name: "ingest_inbox",
-    description: "Process all PDF files in the inbox directory.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "ingest_document",
+    name: "ingest",
     description: "Process a single PDF document for ingestion.",
     inputSchema: {
       type: "object",
@@ -64,18 +50,9 @@ const DEFAULT_TOOLS: ToolDef[] = [
     },
   },
   {
-    name: "get_doc_status",
-    description: "Query document processing status.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        document_id: { type: "string" },
-        file_name: { type: "string" },
-        status_filter: { type: "string" },
-        limit: { type: "number", default: 20 },
-        offset: { type: "number", default: 0 },
-      },
-    },
+    name: "ingest_all",
+    description: "Ingest all PDF files in the inbox directory.",
+    inputSchema: { type: "object", properties: {} },
   },
   {
     name: "list_documents",
@@ -83,8 +60,9 @@ const DEFAULT_TOOLS: ToolDef[] = [
     inputSchema: {
       type: "object",
       properties: {
-        filters: { type: "object" },
-        only_latest: { type: "boolean", default: true },
+        status: { type: "string", description: "Filter by document status" },
+        company: { type: "string", description: "Filter by company name" },
+        product_type: { type: "string", description: "Filter by product type" },
         limit: { type: "number", default: 20 },
         offset: { type: "number", default: 0 },
       },
@@ -111,19 +89,6 @@ const DEFAULT_TOOLS: ToolDef[] = [
     description:
       "Get system health status including OpenSearch and API connectivity.",
     inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "confirm_version_update",
-    description:
-      "Confirm whether a new document version should replace the old one.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        document_id: { type: "string" },
-        replace: { type: "boolean", default: false },
-      },
-      required: ["document_id"],
-    },
   },
 ];
 

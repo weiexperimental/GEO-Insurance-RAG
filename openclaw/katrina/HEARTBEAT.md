@@ -1,27 +1,35 @@
 # HEARTBEAT.md - Katrina 定期任務
 
-## 每次 heartbeat 檢查以下項目：
+你必須按以下步驟執行，唔好跳過。
 
-### 1. Inbox 新文件
-Call `get_system_status`：
-- **pending_files > 0** → call `ingest_inbox` 觸發入庫
-- **pending_files = 0** → skip
+## 定期 Heartbeat（每 5 分鐘）
 
-### 2. 入庫狀態
-Call `get_doc_status` 檢查有無新變化：
-- **ready** → 通知用戶：「[文件名] 已成功入庫，識別到係 [公司] 嘅 [產品名稱]」
-- **failed** → 警告用戶：「[文件名] 入庫失敗：[error]」
-- **partial** → 通知用戶：「[文件名] 已入庫但 metadata 唔完整」
-- **awaiting_confirmation** → 提醒用戶確認版本更新
-- 冇新變化 → 唔使講嘢
+### Step 1: 檢查系統狀態
+Call `get_system_status` tool。
 
-### 3. 系統健康
-Call `get_system_status` 快速檢查：
-- OpenSearch 斷線 → 立即通知用戶
-- persist_failures > 0 → 警告用戶「狀態持久化有問題」
-- 其他正常 → 唔使講嘢
+### Step 2: 決定行動
 
-### 規則
-- 只通知有變化嘅嘢，唔好重複報告已經講過嘅狀態
-- 冇嘢要報 → reply HEARTBEAT_OK
-- 深夜（23:00-08:00）只報 failed 同 system down，其他留到朝早
+**情況 A — inbox 有新文件：** `inbox.pending_files > 0`
+→ 通知用戶：「開始入庫 [pending_files] 份文件」
+→ **你必須立即 call `ingest_all` tool**（唔好跳過，呢個係實際觸發入庫嘅動作）
+→ 等 `ingest_all` 返回結果後，通知用戶結果
+→ Reply HEARTBEAT_OK
+
+**情況 B — 冇新文件：** `inbox.pending_files == 0`
+→ Reply HEARTBEAT_OK（靜音）
+
+---
+
+## 回調處理（收到 [入庫回調] 訊息時）
+
+當你收到以 `[入庫回調]` 開頭嘅訊息：
+
+### Step 1: 查詢入庫結果
+從訊息提取 `document_id`，call `list_documents` 查狀態。
+
+### Step 2: 通知用戶
+- 成功：「✅ [file_name] 入庫成功。公司：[company] 產品：[product_name]」
+- 失敗：「❌ [file_name] 入庫失敗」
+
+### Step 3: 檢查 inbox
+Call `get_system_status`，如果 `inbox.pending_files > 0` 通知用戶仲有文件等緊。

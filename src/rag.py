@@ -141,6 +141,18 @@ class RAGEngine:
         )
         await self._lightrag.initialize_storages()
 
+        # Reset stale pipeline_status busy flag (can be stuck after crash)
+        try:
+            from lightrag.kg.shared_storage import get_namespace_data, get_pipeline_status_lock
+            lock = get_pipeline_status_lock(workspace="")
+            async with lock:
+                ps = await get_namespace_data("pipeline_status", workspace="")
+                if ps.get("busy", False):
+                    ps["busy"] = False
+                    ps["request_pending"] = False
+        except Exception:
+            pass  # pipeline_status may not be initialized yet
+
         self._rag = RAGAnything(
             lightrag=self._lightrag,
             llm_model_func=llm_func,
@@ -154,17 +166,25 @@ class RAGEngine:
             ),
         )
 
+    @property
+    def doc_status(self):
+        """Expose LightRAG's doc_status storage for direct access."""
+        return self._lightrag.doc_status
+
     async def query(self, question: str, mode: str = "hybrid", top_k: int = 5) -> str:
         return await self._rag.aquery(question, mode=mode, top_k=top_k)
 
-    async def ingest_document(self, file_path: str, output_dir: str, device: str = "mps", lang: str = "ch") -> None:
-        await self._rag.process_document_complete(
+    async def ingest_document(self, file_path: str, output_dir: str, device: str = "mps", lang: str = "ch", doc_id: str | None = None) -> None:
+        kwargs = dict(
             file_path=file_path,
             output_dir=output_dir,
             parse_method="auto",
             device=device,
             lang=lang,
         )
+        if doc_id:
+            kwargs["doc_id"] = doc_id
+        await self._rag.process_document_complete(**kwargs)
 
     async def delete_document(self, document_id: str) -> bool:
         try:

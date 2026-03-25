@@ -1,7 +1,6 @@
 # src/server.py
 import asyncio
-import json
-import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +9,7 @@ from contextlib import asynccontextmanager
 from fastmcp import FastMCP
 
 from src.config import load_config, AppConfig
-from src.ingestion import IngestionPipeline
+from src.ingestion import IngestionService
 from src.logging_service import RAGLogger
 from src.rag import RAGEngine
 
@@ -27,8 +26,10 @@ mcp = FastMCP("GEO Insurance RAG", lifespan=lifespan)
 _config: AppConfig | None = None
 _rag_engine: RAGEngine | None = None
 _logger: RAGLogger | None = None
-_pipeline: IngestionPipeline | None = None
+_ingestion: IngestionService | None = None
 _os_client = None
+
+
 
 
 def _error_response(error_code: str, message: str, details: dict | None = None) -> dict:
@@ -40,35 +41,13 @@ def _error_response(error_code: str, message: str, details: dict | None = None) 
     }
 
 
-def _ensure_ingestion_index(client):
-    """Create rag-ingestion-status index if it doesn't exist."""
-    if not client.indices.exists(index="rag-ingestion-status"):
-        client.indices.create(index="rag-ingestion-status", body={
-            "mappings": {
-                "properties": {
-                    "document_id": {"type": "keyword"},
-                    "file_name": {"type": "keyword"},
-                    "file_path": {"type": "keyword"},
-                    "file_hash": {"type": "keyword"},
-                    "status": {"type": "keyword"},
-                    "ingested_at": {"type": "date"},
-                    "metadata": {"type": "object", "dynamic": True},
-                    "stages": {"type": "nested"},
-                }
-            }
-        })
-
-
 @mcp.tool
 async def query(
     question: str,
-    filters: dict | None = None,
     mode: str = "auto",
     top_k: int = 5,
-    only_latest: bool = True,
 ) -> dict[str, Any]:
-    """Search insurance product information using semantic search and knowledge graph.
-    Supports filtering by company, product_type, document_type."""
+    """Search insurance product information using semantic search and knowledge graph."""
     if not _rag_engine:
         return _error_response("OPENSEARCH_UNAVAILABLE", "RAG engine not initialized")
 
@@ -85,7 +64,6 @@ async def query(
             "metadata": {
                 "query_mode": effective_mode,
                 "total_results": 1,
-                "filters_applied": filters or {},
                 "retrieval_time_ms": elapsed,
                 "documents_searched": 0,
                 "knowledge_graph_entities_matched": 0,
@@ -96,112 +74,117 @@ async def query(
 
 
 @mcp.tool
-async def ingest_inbox() -> dict[str, Any]:
-    """Process all PDF files in the inbox directory."""
-    if not _pipeline or not _config:
-        return _error_response("OPENSEARCH_UNAVAILABLE", "System not initialized")
-
-    inbox = Path(_config.paths.inbox_dir)
-    files = [f for f in inbox.iterdir() if f.suffix.lower() == ".pdf"]
-
-    queued = []
-    skipped = []
-    for f in files:
-        result = await _pipeline.enqueue(str(f))
-        if result.get("duplicate"):
-            skipped.append(f.name)
-        else:
-            queued.append(f.name)
-
-    if queued:
-        asyncio.create_task(_pipeline.process_queue())
-
-    return {"queued": len(queued), "skipped": len(skipped), "files": queued}
-
-
-@mcp.tool
-async def ingest_document(file_path: str) -> dict[str, Any]:
+async def ingest(file_path: str) -> dict[str, Any]:
     """Process a single PDF document for ingestion."""
-    if not _pipeline:
+    if not _ingestion:
         return _error_response("OPENSEARCH_UNAVAILABLE", "System not initialized")
 
     if not Path(file_path).exists():
         return _error_response("VALIDATION_FAILED", f"File not found: {file_path}")
 
-    result = await _pipeline.enqueue(file_path)
-    asyncio.create_task(_pipeline.process_queue())
-    return result
+    # Pre-check dedup BEFORE fire-and-forget (so caller knows immediately)
+    from src.ingestion import _file_doc_id
+    doc_id = _file_doc_id(str(Path(file_path).resolve()))
+    try:
+        existing = await _rag_engine.doc_status.get_by_id(doc_id)
+        if existing and existing.get("status") == "processed":
+            # Remove duplicate file — already ingested, no need to keep
+            try:
+                Path(file_path).unlink()
+            except OSError:
+                pass
+            meta = existing.get("metadata", {})
+            return {
+                "status": "already_exists",
+                "file": Path(file_path).name,
+                "document_id": doc_id,
+                "metadata": {k: v for k, v in meta.items() if k in (
+                    "company", "product_name", "product_type", "document_type", "document_date"
+                )},
+            }
+    except Exception:
+        pass
+
+    # Fire-and-forget: return immediately, process in background via create_task
+    async def _bg():
+        try:
+            await _ingestion.ingest(file_path)
+        except Exception as e:
+            print(f"Ingest error [{Path(file_path).name}]: {e}", file=sys.stderr)
+
+    asyncio.create_task(_bg())
+    return {"started": True, "file": Path(file_path).name}
 
 
 @mcp.tool
-async def get_doc_status(
-    document_id: str | None = None,
-    file_name: str | None = None,
-    status_filter: str | None = None,
-    limit: int = 20,
-    offset: int = 0,
-) -> dict[str, Any]:
-    """Query document processing status."""
-    if not _pipeline:
+async def ingest_all() -> dict[str, Any]:
+    """Ingest all PDF files in the inbox directory. Sequential processing."""
+    if not _ingestion or not _config:
         return _error_response("OPENSEARCH_UNAVAILABLE", "System not initialized")
 
-    all_statuses = _pipeline.get_all_statuses()
-    docs = list(all_statuses.values())
+    inbox = Path(_config.paths.inbox_dir).resolve()
+    files = [f for f in inbox.iterdir() if f.suffix.lower() == ".pdf"] if inbox.is_dir() else []
 
-    if document_id:
-        docs = [d for d in docs if d["document_id"] == document_id]
-    if file_name:
-        docs = [d for d in docs if d["file_name"] == file_name]
-    if status_filter:
-        docs = [d for d in docs if d["status"] == status_filter]
+    if not files:
+        return {"total": 0, "results": []}
 
-    total = len(docs)
-    docs = docs[offset : offset + limit]
+    # Fire-and-forget: return immediately, process all in background sequentially
+    async def _bg():
+        for f in files:
+            try:
+                await _ingestion.ingest(str(f))
+            except Exception as e:
+                print(f"Ingest error [{f.name}]: {e}", file=sys.stderr)
 
-    return {"documents": docs, "total": total, "limit": limit, "offset": offset}
+    asyncio.create_task(_bg())
+    return {"total": len(files), "started": True, "files": [f.name for f in files]}
 
 
 @mcp.tool
 async def list_documents(
-    filters: dict | None = None,
-    only_latest: bool = True,
-    limit: int = 20,
+    status: str | None = None,
+    company: str | None = None,
+    product_type: str | None = None,
+    limit: int = 50,
     offset: int = 0,
 ) -> dict[str, Any]:
-    """List all indexed documents with metadata."""
-    if not _pipeline:
-        return _error_response("OPENSEARCH_UNAVAILABLE", "System not initialized")
+    """List documents with optional filters. Reads from LightRAG doc_status."""
+    if not _os_client:
+        return _error_response("OPENSEARCH_UNAVAILABLE", "OpenSearch not connected")
 
-    all_statuses = _pipeline.get_all_statuses()
-    docs = [d for d in all_statuses.values() if d["status"] in ("ready", "partial")]
+    query_parts = []
+    if status:
+        query_parts.append({"term": {"status": status}})
+    if company:
+        query_parts.append({"match": {"metadata.company": company}})
+    if product_type:
+        query_parts.append({"term": {"metadata.product_type.keyword": product_type}})
 
-    if only_latest:
-        docs = [d for d in docs if d.get("metadata", {}).get("is_latest", True)]
-
-    if filters:
-        for key, val in filters.items():
-            docs = [d for d in docs if d.get("metadata", {}).get(key) == val]
-
-    total = len(docs)
-    docs = docs[offset : offset + limit]
-
+    body = {
+        "query": {"bool": {"must": query_parts}} if query_parts else {"match_all": {}},
+        "sort": [{"updated_at": {"order": "desc"}}],
+        "from": offset,
+        "size": limit,
+    }
+    resp = _os_client.search(index="doc_status", body=body)
+    documents = []
+    for hit in resp["hits"]["hits"]:
+        src = hit["_source"]
+        meta = src.get("metadata") or {}
+        documents.append({
+            "document_id": hit["_id"],
+            "file_name": meta.get("file_name") or src.get("file_path", ""),
+            "status": src.get("status", ""),
+            "metadata": {k: v for k, v in meta.items() if k in (
+                "company", "product_name", "product_type", "document_type", "document_date"
+            )},
+            "chunks_count": src.get("chunks_count"),
+            "created_at": src.get("created_at"),
+            "updated_at": src.get("updated_at"),
+        })
     return {
-        "documents": [
-            {
-                "document_id": d["document_id"],
-                "file_name": d["file_name"],
-                "company": d.get("metadata", {}).get("company", ""),
-                "product_name": d.get("metadata", {}).get("product_name", ""),
-                "product_type": d.get("metadata", {}).get("product_type", ""),
-                "document_type": d.get("metadata", {}).get("document_type", ""),
-                "document_date": d.get("metadata", {}).get("document_date", ""),
-                "is_latest": d.get("metadata", {}).get("is_latest", True),
-                "ingested_at": d.get("ingested_at", ""),
-                "status": d["status"],
-            }
-            for d in docs
-        ],
-        "total": total,
+        "documents": documents,
+        "total": resp["hits"]["total"]["value"],
         "limit": limit,
         "offset": offset,
     }
@@ -225,70 +208,37 @@ async def delete_document(document_id: str, confirm: bool = False) -> dict[str, 
 
 @mcp.tool
 async def get_system_status() -> dict[str, Any]:
-    """Get system health status including OpenSearch and API connectivity."""
-    os_status = "disconnected"
-    docs_indexed = 0
+    """System health and document counts."""
+    result = {"opensearch": {}, "documents": {}, "inbox": {}}
 
-    if _os_client:
-        try:
-            _os_client.info()
-            os_status = "healthy"
-        except Exception:
-            os_status = "degraded"
+    # OpenSearch health
+    try:
+        health = _os_client.cluster.health()
+        result["opensearch"]["status"] = health.get("status", "unknown")
+    except Exception:
+        result["opensearch"]["status"] = "disconnected"
 
-    inbox_count = 0
-    if _config and _pipeline:
-        all_inbox = set(str(f) for f in Path(_config.paths.inbox_dir).glob("*.pdf"))
-        tracked = set(
-            s["file_path"] for s in _pipeline.get_all_statuses().values()
-            if s["status"] not in ("failed",)
-        )
-        inbox_count = len(all_inbox - tracked)
+    # Document counts from doc_status
+    try:
+        counts = await _rag_engine.doc_status.get_all_status_counts()
+        result["documents"] = counts
+    except Exception:
+        result["documents"] = {}
 
-    return {
-        "opensearch": {
-            "status": os_status,
-            "documents_indexed": docs_indexed,
-            "index_size_mb": 0.0,
-        },
-        "inbox": {
-            "pending_files": inbox_count,
-            "heartbeat_inbox_check": True,
-        },
-        "persistence": {
-            "failures": _pipeline._persist_failures if _pipeline else 0,
-        },
-        "models": {
-            "llm": _config.llm.model if _config else "",
-            "embedding": _config.embedding.model if _config else "",
-            "vision": _config.vision.model if _config else "",
-            "api_status": "healthy",
-        },
-    }
+    # Inbox
+    try:
+        inbox = Path(_config.paths.inbox_dir).resolve()
+        files = [f for f in inbox.iterdir() if f.suffix.lower() == ".pdf"] if inbox.is_dir() else []
+        result["inbox"]["pending_files"] = len(files)
+    except Exception:
+        result["inbox"]["pending_files"] = 0
 
-
-@mcp.tool
-async def confirm_version_update(document_id: str, replace: bool = False) -> dict[str, Any]:
-    """Confirm whether a new document version should replace the old one."""
-    if not _pipeline:
-        return _error_response("OPENSEARCH_UNAVAILABLE", "System not initialized")
-
-    status = _pipeline.get_status(document_id)
-    if not status:
-        return _error_response("DOCUMENT_NOT_FOUND", f"Document {document_id} not found")
-    if status["status"] != "awaiting_confirmation":
-        return _error_response("INVALID_PARAMETERS", f"Document is not awaiting confirmation (status: {status['status']})")
-
-    return {
-        "success": True,
-        "old_document_id": None,
-        "message": "Version update confirmed" if replace else "Document indexed as independent",
-    }
+    return result
 
 
 async def _initialize():
     """Initialize all components with OpenSearch health check retry."""
-    global _config, _rag_engine, _logger, _pipeline, _os_client
+    global _config, _rag_engine, _logger, _ingestion, _os_client
 
     _config = load_config()
     _logger = RAGLogger(log_dir=_config.paths.log_dir)
@@ -307,12 +257,7 @@ async def _initialize():
             if attempt < 11:
                 await asyncio.sleep(5)
             else:
-                print("WARNING: OpenSearch not available, starting in degraded mode")
-
-    try:
-        _ensure_ingestion_index(_os_client)
-    except Exception:
-        print("WARNING: Could not create ingestion index, will retry on first use")
+                print("WARNING: OpenSearch not available, starting in degraded mode", file=sys.stderr)
 
     _rag_engine = RAGEngine(
         llm_config=_config.llm,
@@ -324,16 +269,11 @@ async def _initialize():
     try:
         await _rag_engine.initialize()
     except Exception as e:
-        print(f"WARNING: RAG engine init failed: {e}")
+        print(f"WARNING: RAG engine init failed: {e}", file=sys.stderr)
 
-    _pipeline = IngestionPipeline(
+    _ingestion = IngestionService(
         config=_config, rag_engine=_rag_engine, logger=_logger,
-        opensearch_client=_os_client,
     )
-    recovered = await _pipeline.recover_crashed()
-    if recovered:
-        print(f"Recovered {len(recovered)} crashed documents", flush=True)
-        await _pipeline.process_queue()
 
 
 if __name__ == "__main__":

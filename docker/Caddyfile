@@ -1,0 +1,8 @@
+:80 {
+	# Frontend — Next.js
+	reverse_proxy /api/* admin-backend:8080
+	reverse_proxy /ws admin-backend:8080
+
+	# Everything else → frontend
+	reverse_proxy admin-frontend:3000
+}

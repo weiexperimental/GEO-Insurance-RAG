@@ -7,3 +7,6 @@ data/inbox/*.pdf
 data/processed/*.pdf
 data/failed/*.pdf
 .DS_Store
+.superpowers/
+admin/frontend/node_modules/
+admin/frontend/.next/

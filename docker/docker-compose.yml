@@ -1,4 +1,5 @@
 services:
+  # ─── OpenSearch ───────────────────────────────────────────────────────
   opensearch:
     image: opensearchproject/opensearch:3.0.0
     container_name: geo-rag-opensearch
@@ -7,9 +8,15 @@ services:
       - DISABLE_SECURITY_PLUGIN=true
       - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
     ports:
-      - "9200:9200"
+      - "127.0.0.1:9200:9200"   # Only localhost — not exposed via Tailscale
     volumes:
       - opensearch-data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
 
   opensearch-dashboards:
     image: opensearchproject/opensearch-dashboards:3.0.0
@@ -18,9 +25,64 @@ services:
       - OPENSEARCH_HOSTS=["http://opensearch:9200"]
       - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
     ports:
-      - "5601:5601"
+      - "127.0.0.1:5601:5601"   # Only localhost
     depends_on:
-      - opensearch
+      opensearch:
+        condition: service_healthy
+
+  # ─── Admin Backend (FastAPI) ─────────────────────────────────────────
+  admin-backend:
+    build:
+      context: ../admin/backend
+    container_name: geo-rag-admin-backend
+    env_file: ../.env
+    environment:
+      - OPENSEARCH_HOST=opensearch
+      - OPENSEARCH_PORT=9200
+      - LOG_DIR=/logs
+      - CORS_ORIGINS=http://localhost:3000,http://localhost
+    volumes:
+      - ../logs:/logs
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/api/system/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  # ─── Admin Frontend (Next.js) ───────────────────────────────────────
+  admin-frontend:
+    build:
+      context: ../admin/frontend
+      args:
+        # Empty = relative paths (Caddy proxies /api/* to backend)
+        NEXT_PUBLIC_API_URL: ""
+        NEXT_PUBLIC_WS_URL: ""
+    container_name: geo-rag-admin-frontend
+    depends_on:
+      admin-backend:
+        condition: service_healthy
+
+  # ─── Caddy Reverse Proxy ────────────────────────────────────────────
+  # Unifies frontend + backend under one port.
+  # Access from Tailscale: http://100.x.x.x
+  caddy:
+    image: caddy:2-alpine
+    container_name: geo-rag-caddy
+    ports:
+      - "0.0.0.0:80:80"        # Exposed to all interfaces (Tailscale accessible)
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on:
+      admin-frontend:
+        condition: service_started
+      admin-backend:
+        condition: service_healthy
 
 volumes:
   opensearch-data:
+  caddy-data:

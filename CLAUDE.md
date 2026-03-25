@@ -31,7 +31,7 @@
 
 - `docs/superpowers/specs/2026-03-22-mcp-rag-insurance-design.md` — 完整設計 spec
 - `docs/superpowers/plans/2026-03-22-mcp-rag-insurance-plan.md` — 實現計劃
-- `src/server.py` — MCP server 入口（8 個 tools）
+- `src/server.py` — MCP server 入口（6 個 tools：`query`, `ingest`, `ingest_all`, `list_documents`, `delete_document`, `get_system_status`）
 - `src/rag.py` — RAG engine wrapper
 - `src/ingestion.py` — 入庫 pipeline
 - `docker/docker-compose.yml` — OpenSearch Docker 配置
@@ -44,7 +44,7 @@ cd GEO-Insurance-RAG
 cp .env.example .env  # 填入 YIBU API keys
 uv venv --python 3.12 .venv
 source .venv/bin/activate
-uv pip install "raganything>=1.2.9" "mineru[mlx]>=2.7.6" fastmcp watchdog opensearch-py python-dotenv pytest pytest-asyncio
+uv pip install "raganything>=1.2.9" "mineru[mlx]>=2.7.6" fastmcp watchdog opensearch-py python-dotenv pytest pytest-asyncio aiohttp
 docker compose -f docker/docker-compose.yml up -d
 # 等 ~30s OpenSearch 啟動
 python -m pytest tests/ -v  # 20 tests should pass

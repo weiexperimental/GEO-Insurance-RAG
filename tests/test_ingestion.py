@@ -1,265 +1,280 @@
-# tests/test_ingestion.py
-import hashlib
-import tempfile
+import asyncio
+import pytest
+from unittest.mock import MagicMock, AsyncMock, patch
 from pathlib import Path
 
-import pytest
+from src.ingestion import IngestionService, validate_file, _read_parsed_content, _file_doc_id
 
 
 @pytest.fixture
-def pipeline(tmp_path):
-    """Create a minimal IngestionPipeline with mocked dependencies."""
-    from unittest.mock import MagicMock
-    from src.ingestion import IngestionPipeline
-
+def mock_config():
     config = MagicMock()
     config.limits.max_file_size_mb = 100
-    config.paths.inbox_dir = str(tmp_path / "inbox")
-    config.paths.processed_dir = str(tmp_path / "processed")
-    config.paths.failed_dir = str(tmp_path / "failed")
-    for d in ["inbox", "processed", "failed"]:
-        (tmp_path / d).mkdir()
-
-    rag = MagicMock()
-    logger = MagicMock()
-    logger.log = MagicMock()
-
-    return IngestionPipeline(config=config, rag_engine=rag, logger=logger)
+    config.paths.processed_dir = "/tmp/processed"
+    config.paths.failed_dir = "/tmp/failed"
+    config.mineru.device = "mps"
+    config.mineru.lang = "ch"
+    config.llm = MagicMock()
+    config.callback.gateway_port = 3000
+    config.callback.hooks_token = ""
+    config.callback.notify_to = ""
+    return config
 
 
-@pytest.mark.asyncio
-async def test_enqueue_path_dedup(pipeline, tmp_path):
-    """Same file path enqueued twice: second returns duplicate."""
-    pdf = tmp_path / "inbox" / "test.pdf"
-    pdf.write_bytes(b"%PDF-1.4 test")
-
-    result1 = await pipeline.enqueue(str(pdf))
-    assert result1["status"] == "pending"
-    assert "duplicate" not in result1
-
-    result2 = await pipeline.enqueue(str(pdf))
-    assert result2["duplicate"] is True
-    assert result2["document_id"] == result1["document_id"]
-
-
-@pytest.mark.asyncio
-async def test_enqueue_failed_allows_retry(pipeline, tmp_path):
-    """A file that previously failed can be re-enqueued."""
-    pdf = tmp_path / "inbox" / "retry.pdf"
-    pdf.write_bytes(b"%PDF-1.4 test")
-
-    result1 = await pipeline.enqueue(str(pdf))
-    doc_id = result1["document_id"]
-    pipeline._doc_statuses[doc_id]["status"] = "failed"
-
-    result2 = await pipeline.enqueue(str(pdf))
-    assert result2["status"] == "pending"
-    assert result2["document_id"] != doc_id
-
-
-def test_validate_file_accepts_valid_pdf():
-    from src.ingestion import validate_file
-
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-        f.write(b"%PDF-1.4 test content")
-        f.flush()
-        result = validate_file(f.name, max_size_mb=100)
-        assert result["valid"] is True
-
-
-def test_validate_file_rejects_non_pdf():
-    from src.ingestion import validate_file
-
-    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as f:
-        f.write(b"not a pdf")
-        f.flush()
-        result = validate_file(f.name, max_size_mb=100)
-        assert result["valid"] is False
-        assert "PDF" in result["reason"]
-
-
-def test_validate_file_rejects_oversized():
-    from src.ingestion import validate_file
-
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-        f.write(b"%PDF" + b"x" * (2 * 1024 * 1024))  # ~2MB
-        f.flush()
-        result = validate_file(f.name, max_size_mb=1)  # 1MB limit
-        assert result["valid"] is False
-        assert "size" in result["reason"].lower()
-
-
-def test_compute_file_hash():
-    from src.ingestion import compute_file_hash
-
-    with tempfile.NamedTemporaryFile(delete=False) as f:
-        f.write(b"test content for hashing")
-        f.flush()
-        h = compute_file_hash(f.name)
-        expected = hashlib.sha256(b"test content for hashing").hexdigest()
-        assert h == expected
+_DEFAULT_DOC_STATUS = {
+    "_id": "doc-abc123",
+    "status": "processed",
+    "metadata": {"processing_start_time": 123},
+}
 
 
 @pytest.fixture
-def mock_os_client():
-    """Mock OpenSearch client."""
-    from unittest.mock import MagicMock
-    client = MagicMock()
-    client.index = MagicMock()
-    client.search = MagicMock(return_value={"hits": {"hits": []}})
-    client.indices = MagicMock()
-    client.indices.exists = MagicMock(return_value=True)
-    return client
+def mock_rag():
+    rag = AsyncMock()
+    rag.ingest_document = AsyncMock()
+    rag.doc_status = AsyncMock()
+    # Default: None for pre-check (not yet processed); tests that need the
+    # post-ingest lookup value must set their own side_effect or return_value.
+    rag.doc_status.get_by_id = AsyncMock(return_value=None)
+    rag.doc_status.upsert = AsyncMock()
+    return rag
 
 
 @pytest.fixture
-def pipeline_with_os(tmp_path, mock_os_client):
-    """Pipeline with OpenSearch client."""
-    from unittest.mock import MagicMock
-    from src.ingestion import IngestionPipeline
-    config = MagicMock()
-    config.limits.max_file_size_mb = 100
-    config.paths.inbox_dir = str(tmp_path / "inbox")
-    config.paths.processed_dir = str(tmp_path / "processed")
-    config.paths.failed_dir = str(tmp_path / "failed")
-    for d in ["inbox", "processed", "failed"]:
-        (tmp_path / d).mkdir()
-    return IngestionPipeline(config=config, rag_engine=MagicMock(), logger=MagicMock(), opensearch_client=mock_os_client)
+def mock_logger():
+    return MagicMock()
+
+
+@pytest.fixture
+def service(mock_config, mock_rag, mock_logger):
+    return IngestionService(mock_config, mock_rag, mock_logger)
+
+
+def test_validate_file_valid(tmp_path):
+    pdf = tmp_path / "test.pdf"
+    pdf.write_bytes(b"%PDF-1.0 test content")
+    result = validate_file(str(pdf), max_size_mb=100)
+    assert result["valid"] is True
+
+
+def test_validate_file_not_pdf(tmp_path):
+    txt = tmp_path / "test.txt"
+    txt.write_text("hello")
+    result = validate_file(str(txt), max_size_mb=100)
+    assert result["valid"] is False
+    assert "Not a PDF" in result["reason"]
+
+
+def test_validate_file_too_large(tmp_path):
+    pdf = tmp_path / "test.pdf"
+    pdf.write_bytes(b"%PDF" + b"x" * (2 * 1024 * 1024))
+    result = validate_file(str(pdf), max_size_mb=1)
+    assert result["valid"] is False
+    assert "exceeds" in result["reason"]
 
 
 @pytest.mark.asyncio
-async def test_persist_status_success(pipeline_with_os, mock_os_client, tmp_path):
-    """Status changes are persisted to OpenSearch."""
-    pdf = tmp_path / "inbox" / "persist.pdf"
-    pdf.write_bytes(b"%PDF-1.4 test")
-    result = await pipeline_with_os.enqueue(str(pdf))
-    doc_id = result["document_id"]
-    mock_os_client.index.assert_called()
-    call_args = mock_os_client.index.call_args
-    assert call_args.kwargs["index"] == "rag-ingestion-status"
-    assert call_args.kwargs["id"] == doc_id
+async def test_ingest_calls_rag_engine(service, mock_rag, tmp_path):
+    pdf = tmp_path / "test.pdf"
+    pdf.write_bytes(b"%PDF-1.0 test")
+
+    # pre-check returns None (not processed yet), post-ingest lookup returns doc
+    mock_rag.doc_status.get_by_id.side_effect = [
+        None,  # pre-check
+        _DEFAULT_DOC_STATUS,  # post-ingest lookup
+    ]
+
+    with patch("src.ingestion.extract_metadata", new_callable=AsyncMock, return_value={"company": "AIA"}):
+        with patch("src.ingestion._read_parsed_content", return_value="test content"):
+            with patch("src.ingestion.shutil"):
+                result = await service.ingest(str(pdf))
+
+    mock_rag.ingest_document.assert_awaited_once()
+    assert result["status"] == "processed"
 
 
 @pytest.mark.asyncio
-async def test_persist_status_failure_increments_counter(tmp_path):
-    """OpenSearch failure increments counter but doesn't crash pipeline."""
-    from unittest.mock import MagicMock
-    from src.ingestion import IngestionPipeline
-    os_client = MagicMock()
-    os_client.index = MagicMock(side_effect=Exception("OS down"))
-    os_client.search = MagicMock(return_value={"hits": {"hits": []}})
-    os_client.indices = MagicMock()
-    os_client.indices.exists = MagicMock(return_value=True)
-    config = MagicMock()
-    config.limits.max_file_size_mb = 100
-    config.paths.inbox_dir = str(tmp_path / "inbox")
-    config.paths.processed_dir = str(tmp_path / "processed")
-    config.paths.failed_dir = str(tmp_path / "failed")
-    for d in ["inbox", "processed", "failed"]:
-        (tmp_path / d).mkdir()
-    pipeline = IngestionPipeline(config=config, rag_engine=MagicMock(), logger=MagicMock(), opensearch_client=os_client)
-    pdf = tmp_path / "inbox" / "fail.pdf"
-    pdf.write_bytes(b"%PDF-1.4 test")
-    result = await pipeline.enqueue(str(pdf))
-    assert result["status"] == "pending"
-    assert pipeline._persist_failures >= 1
+async def test_ingest_enriches_metadata(service, mock_rag, tmp_path):
+    pdf = tmp_path / "test.pdf"
+    pdf.write_bytes(b"%PDF-1.0 test")
+
+    # pre-check returns None (not processed yet), post-ingest lookup returns doc
+    mock_rag.doc_status.get_by_id.side_effect = [
+        None,  # pre-check
+        _DEFAULT_DOC_STATUS,  # post-ingest lookup
+    ]
+
+    with patch("src.ingestion.extract_metadata", new_callable=AsyncMock, return_value={"company": "AIA"}):
+        with patch("src.ingestion._read_parsed_content", return_value="content"):
+            with patch("src.ingestion.shutil"):
+                await service.ingest(str(pdf))
+
+    mock_rag.doc_status.upsert.assert_awaited_once()
+    call_args = mock_rag.doc_status.upsert.call_args[0][0]
+    doc_id = list(call_args.keys())[0]
+    assert call_args[doc_id]["metadata"]["company"] == "AIA"
+    assert call_args[doc_id]["metadata"]["processing_start_time"] == 123  # preserved from LightRAG
 
 
 @pytest.mark.asyncio
-async def test_load_persisted_state(tmp_path):
-    """Pipeline loads existing state from OpenSearch on init."""
-    from unittest.mock import MagicMock
-    from src.ingestion import IngestionPipeline
-    os_client = MagicMock()
-    os_client.search = MagicMock(return_value={
-        "hits": {"hits": [{"_source": {
-            "document_id": "doc-123", "file_name": "test.pdf",
-            "file_path": "/some/path/test.pdf", "file_hash": "abc123",
-            "status": "ready", "stages": [], "metadata": {}, "ingested_at": "2026-03-23T00:00:00Z",
-        }}]}
-    })
-    os_client.index = MagicMock()
-    os_client.indices = MagicMock()
-    os_client.indices.exists = MagicMock(return_value=True)
-    config = MagicMock()
-    config.limits.max_file_size_mb = 100
-    config.paths.inbox_dir = str(tmp_path / "inbox")
-    config.paths.processed_dir = str(tmp_path / "processed")
-    config.paths.failed_dir = str(tmp_path / "failed")
-    for d in ["inbox", "processed", "failed"]:
-        (tmp_path / d).mkdir()
-    pipeline = IngestionPipeline(config=config, rag_engine=MagicMock(), logger=MagicMock(), opensearch_client=os_client)
-    assert "doc-123" in pipeline._doc_statuses
-    assert "abc123" in pipeline._known_hashes
-    assert "/some/path/test.pdf" in pipeline._path_to_doc_id
+async def test_ingest_validation_failure(service, tmp_path):
+    txt = tmp_path / "test.txt"
+    txt.write_text("not a pdf")
+
+    with patch("src.ingestion.shutil"):
+        result = await service.ingest(str(txt))
+
+    assert result["error"] == "validation_failed"
 
 
 @pytest.mark.asyncio
-async def test_recover_crashed_file_exists(tmp_path):
-    """Recovery re-enqueues documents stuck in processing state."""
-    from unittest.mock import MagicMock
-    from src.ingestion import IngestionPipeline
+async def test_ingest_rag_failure(service, mock_rag, tmp_path):
+    pdf = tmp_path / "test.pdf"
+    pdf.write_bytes(b"%PDF-1.0 test")
+    mock_rag.ingest_document.side_effect = Exception("GPU OOM")
 
-    orphan_path = tmp_path / "inbox" / "orphan.pdf"
-    orphan_path.parent.mkdir(exist_ok=True)
-    orphan_path.write_bytes(b"%PDF-1.4 orphan")
+    with patch("src.ingestion.shutil"):
+        with patch("src.ingestion.asyncio.sleep", new_callable=AsyncMock):
+            result = await service.ingest(str(pdf))
 
-    os_client = MagicMock()
-    os_client.search = MagicMock(return_value={
-        "hits": {"hits": [{"_source": {
-            "document_id": "orphan-1", "file_name": "orphan.pdf",
-            "file_path": str(orphan_path), "file_hash": None,
-            "status": "parsing", "stages": [], "metadata": None, "ingested_at": None,
-        }}]}
-    })
-    os_client.index = MagicMock()
-    os_client.indices = MagicMock()
-    os_client.indices.exists = MagicMock(return_value=True)
-
-    config = MagicMock()
-    config.limits.max_file_size_mb = 100
-    config.paths.inbox_dir = str(tmp_path / "inbox")
-    config.paths.processed_dir = str(tmp_path / "processed")
-    config.paths.failed_dir = str(tmp_path / "failed")
-    for d in ["inbox", "processed", "failed"]:
-        (tmp_path / d).mkdir(exist_ok=True)
-
-    pipeline = IngestionPipeline(config=config, rag_engine=MagicMock(), logger=MagicMock(), opensearch_client=os_client)
-
-    recovered = await pipeline.recover_crashed()
-    assert len(recovered) == 1
-    assert str(orphan_path) in recovered
-    assert pipeline._doc_statuses["orphan-1"]["status"] == "pending"
+    assert result["error"] == "ingestion_failed"
 
 
 @pytest.mark.asyncio
-async def test_recover_crashed_file_gone(tmp_path):
-    """Recovery marks missing files as failed."""
-    from unittest.mock import MagicMock
-    from src.ingestion import IngestionPipeline
+async def test_ingest_metadata_failure_still_succeeds(service, mock_rag, tmp_path):
+    pdf = tmp_path / "test.pdf"
+    pdf.write_bytes(b"%PDF-1.0 test")
 
-    os_client = MagicMock()
-    os_client.search = MagicMock(return_value={
-        "hits": {"hits": [{"_source": {
-            "document_id": "gone-1", "file_name": "gone.pdf",
-            "file_path": "/nonexistent/gone.pdf", "file_hash": None,
-            "status": "extracting_metadata", "stages": [], "metadata": None, "ingested_at": None,
-        }}]}
-    })
-    os_client.index = MagicMock()
-    os_client.indices = MagicMock()
-    os_client.indices.exists = MagicMock(return_value=True)
+    mock_rag.doc_status.get_by_id.side_effect = [
+        None,  # pre-check
+        _DEFAULT_DOC_STATUS,  # post-ingest lookup
+    ]
 
-    config = MagicMock()
-    config.limits.max_file_size_mb = 100
-    config.paths.inbox_dir = str(tmp_path / "inbox")
-    config.paths.processed_dir = str(tmp_path / "processed")
-    config.paths.failed_dir = str(tmp_path / "failed")
-    for d in ["inbox", "processed", "failed"]:
-        (tmp_path / d).mkdir(exist_ok=True)
+    with patch("src.ingestion.extract_metadata", new_callable=AsyncMock, side_effect=Exception("LLM error")):
+        with patch("src.ingestion._read_parsed_content", return_value="content"):
+            with patch("src.ingestion.shutil"):
+                result = await service.ingest(str(pdf))
 
-    pipeline = IngestionPipeline(config=config, rag_engine=MagicMock(), logger=MagicMock(), opensearch_client=os_client)
+    assert result["status"] == "processed"
+    assert result["metadata"] == {}
 
-    recovered = await pipeline.recover_crashed()
-    assert len(recovered) == 0
-    assert pipeline._doc_statuses["gone-1"]["status"] == "failed"
+
+@pytest.mark.asyncio
+async def test_ingest_sequential_lock(service, mock_rag, tmp_path):
+    """Verify only one ingest runs at a time."""
+    pdf1 = tmp_path / "a.pdf"
+    pdf2 = tmp_path / "b.pdf"
+    pdf1.write_bytes(b"%PDF-1.0 a")
+    pdf2.write_bytes(b"%PDF-1.0 b")
+
+    # Four get_by_id calls: pre-check × 2 + post-ingest lookup × 2
+    mock_rag.doc_status.get_by_id.side_effect = [
+        None, None,  # pre-checks
+        {"_id": "doc-a", "status": "processed", "metadata": {}},
+        {"_id": "doc-b", "status": "processed", "metadata": {}},
+    ]
+
+    call_order = []
+
+    async def slow_ingest(**kwargs):
+        call_order.append("start")
+        await asyncio.sleep(0.1)
+        call_order.append("end")
+
+    mock_rag.ingest_document.side_effect = slow_ingest
+
+    with patch("src.ingestion.extract_metadata", new_callable=AsyncMock, return_value={}):
+        with patch("src.ingestion._read_parsed_content", return_value=""):
+            with patch("src.ingestion.shutil"):
+                await asyncio.gather(
+                    service.ingest(str(pdf1)),
+                    service.ingest(str(pdf2)),
+                )
+
+    # Sequential: start-end-start-end, NOT start-start-end-end
+    assert call_order == ["start", "end", "start", "end"]
+
+
+def test_file_doc_id_deterministic(tmp_path):
+    pdf = tmp_path / "test.pdf"
+    pdf.write_bytes(b"%PDF-1.0 test content")
+    id1 = _file_doc_id(str(pdf))
+    id2 = _file_doc_id(str(pdf))
+    assert id1 == id2
+    assert id1.startswith("doc-")
+
+
+def test_file_doc_id_different_content(tmp_path):
+    a = tmp_path / "a.pdf"
+    b = tmp_path / "b.pdf"
+    a.write_bytes(b"%PDF-1.0 content A")
+    b.write_bytes(b"%PDF-1.0 content B")
+    assert _file_doc_id(str(a)) != _file_doc_id(str(b))
+
+
+@pytest.mark.asyncio
+async def test_ingest_skips_already_processing(service, tmp_path):
+    """Layer 1: in-memory _processing set rejects concurrent duplicate."""
+    pdf = tmp_path / "test.pdf"
+    pdf.write_bytes(b"%PDF-1.0 test")
+    canonical = str(pdf.resolve())
+
+    # Simulate file already being processed
+    service._processing.add(canonical)
+    result = await service.ingest(str(pdf))
+    assert result["status"] == "skipped"
+    assert result["reason"] == "already_processing"
+    service._processing.discard(canonical)
+
+
+@pytest.mark.asyncio
+async def test_ingest_skips_already_processed(service, mock_rag, tmp_path):
+    """Layer 2: doc_status pre-check skips completed files."""
+    pdf = tmp_path / "test.pdf"
+    pdf.write_bytes(b"%PDF-1.0 test")
+
+    mock_rag.doc_status.get_by_id.return_value = {"status": "processed"}
+    result = await service.ingest(str(pdf))
+    assert result["status"] == "skipped"
+    assert result["reason"] == "already_processed"
+    # Should NOT have called ingest_document
+    mock_rag.ingest_document.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ingest_retries_stale_processing(service, mock_rag, tmp_path):
+    """Layer 2: does NOT skip files stuck in 'processing' (stale from crash)."""
+    pdf = tmp_path / "test.pdf"
+    pdf.write_bytes(b"%PDF-1.0 test")
+
+    # First call for pre-check returns "processing" (stale)
+    # Second call after ingest returns the full doc for enrichment
+    mock_rag.doc_status.get_by_id.side_effect = [
+        {"status": "processing"},  # pre-check: stale, allow retry
+        {"_id": "doc-abc", "status": "processed", "metadata": {}},  # post-ingest lookup
+    ]
+
+    with patch("src.ingestion.extract_metadata", new_callable=AsyncMock, return_value={}):
+        with patch("src.ingestion._read_parsed_content", return_value=""):
+            with patch("src.ingestion.shutil"):
+                result = await service.ingest(str(pdf))
+
+    assert result["status"] == "processed"
+    mock_rag.ingest_document.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ingest_skips_if_file_moved(service, mock_rag, tmp_path):
+    """Layer 3: file moved between pre-check and lock acquisition."""
+    pdf = tmp_path / "test.pdf"
+    pdf.write_bytes(b"%PDF-1.0 test")
+    path_str = str(pdf)
+
+    mock_rag.doc_status.get_by_id.return_value = None  # not in doc_status
+
+    # Delete file to simulate it being moved by concurrent ingest
+    pdf.unlink()
+
+    result = await service.ingest(path_str)
+    assert result["status"] == "skipped"
+    assert result["reason"] == "file_moved"

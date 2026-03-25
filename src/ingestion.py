@@ -1,45 +1,21 @@
 # src/ingestion.py
+"""Thin ingestion service: validate → RAGAnything → enrich metadata."""
 import asyncio
-import hashlib
 import logging
 import shutil
-import time
-import uuid
+import hashlib
 from pathlib import Path
 from typing import Any
 
-_logger_mod = logging.getLogger(__name__)
+_logger = logging.getLogger(__name__)
 
 from src.config import AppConfig
 from src.logging_service import RAGLogger
 from src.metadata import extract_metadata
 from src.rag import RAGEngine
-from src.versioning import find_existing_version
 
 
-def validate_file(file_path: str, max_size_mb: int) -> dict[str, Any]:
-    """Validate that file is a PDF within size limits."""
-    path = Path(file_path)
-    if not path.suffix.lower() == ".pdf":
-        return {"valid": False, "reason": f"Not a PDF file: {path.suffix}"}
-
-    size_mb = path.stat().st_size / (1024 * 1024)
-    if size_mb > max_size_mb:
-        return {"valid": False, "reason": f"File size {size_mb:.1f}MB exceeds limit of {max_size_mb}MB"}
-
-    return {"valid": True, "reason": ""}
-
-
-def compute_file_hash(file_path: str) -> str:
-    """Compute SHA-256 hash of a file."""
-    h = hashlib.sha256()
-    with open(file_path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-RETRY_DELAYS = [5, 15, 45]  # Exponential backoff in seconds
+RETRY_DELAYS = [5, 15, 45]
 
 
 async def _retry_async(coro_factory, retries=3, delays=RETRY_DELAYS):
@@ -56,8 +32,7 @@ async def _retry_async(coro_factory, retries=3, delays=RETRY_DELAYS):
 
 
 def _read_parsed_content(output_dir: str, file_name: str) -> str:
-    """Read the markdown output from MinerU parsing.
-    MinerU saves to: {output_dir}/{stem}/hybrid_auto/{stem}.md"""
+    """Read the markdown output from MinerU parsing."""
     stem = Path(file_name).stem
     patterns = [
         f"{stem}/hybrid_auto/{stem}.md",
@@ -72,230 +47,159 @@ def _read_parsed_content(output_dir: str, file_name: str) -> str:
     return ""
 
 
-class IngestionPipeline:
-    def __init__(self, config: AppConfig, rag_engine: RAGEngine, logger: RAGLogger,
-                 opensearch_client=None):
+def _file_doc_id(file_path: str) -> str:
+    """Generate deterministic doc ID from file content (MD5, matching LightRAG doc- prefix)."""
+    content_hash = hashlib.md5(Path(file_path).read_bytes()).hexdigest()
+    return f"doc-{content_hash}"
+
+
+def validate_file(file_path: str, max_size_mb: int) -> dict[str, Any]:
+    """Validate that file is a PDF within size limits."""
+    path = Path(file_path)
+    if not path.suffix.lower() == ".pdf":
+        return {"valid": False, "reason": f"Not a PDF file: {path.suffix}"}
+    size_mb = path.stat().st_size / (1024 * 1024)
+    if size_mb > max_size_mb:
+        return {"valid": False, "reason": f"File size {size_mb:.1f}MB exceeds limit of {max_size_mb}MB"}
+    return {"valid": True, "reason": ""}
+
+
+class IngestionService:
+    """Thin wrapper: validate → RAGAnything → enrich metadata."""
+
+    def __init__(self, config: AppConfig, rag_engine: RAGEngine, logger: RAGLogger):
         self._config = config
         self._rag = rag_engine
         self._logger = logger
-        self._os_client = opensearch_client
-        self._queue: asyncio.Queue = asyncio.Queue()
         self._lock = asyncio.Lock()
-        self._doc_statuses: dict[str, dict] = {}
-        self._known_hashes: set[str] = set()
-        self._path_to_doc_id: dict[str, str] = {}
-        self._persist_failures: int = 0
+        self._processing: set[str] = set()  # in-memory dedup guard
 
-        if self._os_client:
-            self._load_persisted_state()
-
-    def _load_persisted_state(self):
-        """Load existing doc statuses from OpenSearch."""
+        # Gateway callback config
+        self._gateway_port = config.callback.gateway_port
+        self._hooks_token = config.callback.hooks_token
+        self._notify_to = config.callback.notify_to
         try:
-            resp = self._os_client.search(
-                index="rag-ingestion-status",
-                body={"query": {"match_all": {}}, "size": 10000},
-            )
-            for hit in resp["hits"]["hits"]:
-                doc = hit["_source"]
-                self._doc_statuses[doc["document_id"]] = doc
-                if doc.get("file_hash"):
-                    self._known_hashes.add(doc["file_hash"])
-                if doc.get("file_path"):
-                    self._path_to_doc_id[doc["file_path"]] = doc["document_id"]
-        except Exception as e:
-            _logger_mod.warning("Failed to load persisted state: %s", e)
+            import aiohttp  # noqa: F401
+            self._callback_enabled = bool(self._hooks_token)
+        except ImportError:
+            self._callback_enabled = False
 
-    def _persist_status(self, doc_id: str):
-        """Write a single doc status to OpenSearch. Best-effort with logging."""
-        if not self._os_client:
-            return
+    async def ingest(self, file_path: str) -> dict[str, Any]:
+        """Ingest a single PDF. Three-layer dedup + sequential GPU lock."""
+        canonical = str(Path(file_path).resolve())
+
+        # Layer 1: In-memory guard — reject if already in-flight
+        # (safe in asyncio single-thread: no await between check and add)
+        if canonical in self._processing:
+            return {"status": "skipped", "reason": "already_processing"}
+
+        # Layer 2: doc_status pre-check — skip if already completed
         try:
-            self._os_client.index(
-                index="rag-ingestion-status",
-                id=doc_id,
-                body=self._doc_statuses[doc_id],
-            )
-        except Exception as e:
-            self._persist_failures += 1
-            _logger_mod.warning(
-                "Failed to persist status for %s: %s (total failures: %d)",
-                doc_id, e, self._persist_failures,
-            )
+            doc_id = _file_doc_id(canonical)
+            existing = await self._rag.doc_status.get_by_id(doc_id)
+            if existing and existing.get("status") == "processed":
+                return {"status": "skipped", "reason": "already_processed"}
+        except FileNotFoundError:
+            # File already gone — will be caught by Layer 3
+            pass
+        except Exception:
+            pass  # OpenSearch unavailable — proceed with ingestion
 
-    def get_status(self, document_id: str) -> dict | None:
-        return self._doc_statuses.get(document_id)
+        self._processing.add(canonical)
+        try:
+            async with self._lock:
+                # Layer 3: Re-check file exists (may have been moved by concurrent ingest)
+                if not Path(canonical).exists():
+                    return {"status": "skipped", "reason": "file_moved"}
+                return await self._ingest_single(canonical)
+        finally:
+            self._processing.discard(canonical)
 
-    def get_all_statuses(self) -> dict[str, dict]:
-        return dict(self._doc_statuses)
-
-    async def enqueue(self, file_path: str) -> dict[str, Any]:
+    async def _ingest_single(self, file_path: str) -> dict[str, Any]:
         file_path = str(Path(file_path).resolve())
-
-        if file_path in self._path_to_doc_id:
-            existing_id = self._path_to_doc_id[file_path]
-            existing = self._doc_statuses.get(existing_id)
-            if existing and existing["status"] not in ("failed",):
-                return {
-                    "document_id": existing_id,
-                    "status": existing["status"],
-                    "duplicate": True,
-                }
-
-        doc_id = str(uuid.uuid4())
-        self._path_to_doc_id[file_path] = doc_id
-        self._doc_statuses[doc_id] = {
-            "document_id": doc_id,
-            "file_name": Path(file_path).name,
-            "file_path": file_path,
-            "status": "pending",
-            "stages": [],
-            "metadata": None,
-            "file_hash": None,
-            "ingested_at": None,
-        }
-        self._persist_status(doc_id)
-        await self._queue.put((doc_id, file_path))
-        return {"document_id": doc_id, "status": "pending"}
-
-    async def process_queue(self) -> None:
-        async with self._lock:
-            while not self._queue.empty():
-                doc_id, file_path = await self._queue.get()
-                await self._process_single(doc_id, file_path)
-
-    async def _process_single(self, doc_id: str, file_path: str) -> None:
-        from datetime import datetime, timezone
-        status = self._doc_statuses[doc_id]
         file_name = Path(file_path).name
-        is_reprocess = False
+        doc_id = _file_doc_id(file_path)
 
-        # Stage: validating
-        status["status"] = "validating"
-        start = time.time()
+        # 1. Validate
         validation = validate_file(file_path, self._config.limits.max_file_size_mb)
-        elapsed = int((time.time() - start) * 1000)
-        status["stages"].append({"stage": "validating", "status": "success" if validation["valid"] else "failed", "duration_ms": elapsed, "error": validation.get("reason") or None})
-
         if not validation["valid"]:
-            status["status"] = "failed"
-            self._persist_status(doc_id)
             shutil.move(file_path, str(Path(self._config.paths.failed_dir) / file_name))
-            self._logger.log(document=file_name, stage="validating", status="failed", details={"reason": validation["reason"]})
-            return
+            self._logger.log(document=file_name, stage="validate", status="failed",
+                             details={"reason": validation["reason"]})
+            return {"error": "validation_failed", "reason": validation["reason"]}
 
-        # Duplicate check
-        file_hash = compute_file_hash(file_path)
-        status["file_hash"] = file_hash
-
-        if file_hash in self._known_hashes:
-            existing = next((s for s in self._doc_statuses.values() if s.get("file_hash") == file_hash and s["document_id"] != doc_id), None)
-            if existing and existing.get("status") in ("partial", "failed"):
-                is_reprocess = True
-            elif existing:
-                status["status"] = "failed"
-                self._persist_status(doc_id)
-                status["stages"].append({"stage": "duplicate_check", "status": "skipped", "duration_ms": 0, "error": "Duplicate file"})
-                self._logger.log(document=file_name, stage="duplicate_check", status="skipped", details={"reason": "duplicate"})
-                return
-
-        self._known_hashes.add(file_hash)
-
-        # Stage: parsing (with retry)
-        status["status"] = "parsing"
-        self._persist_status(doc_id)
-        start = time.time()
+        # 2. Ingest via RAGAnything (with retry)
         try:
             await _retry_async(lambda: self._rag.ingest_document(
                 file_path=file_path,
                 output_dir=self._config.paths.processed_dir,
                 device=self._config.mineru.device,
                 lang=self._config.mineru.lang,
+                doc_id=doc_id,
             ))
-            elapsed = int((time.time() - start) * 1000)
-            status["stages"].append({"stage": "parsing", "status": "success", "duration_ms": elapsed, "error": None})
-            self._logger.log(document=file_name, stage="parsing", status="success", duration_ms=elapsed)
         except Exception as e:
-            elapsed = int((time.time() - start) * 1000)
-            status["stages"].append({"stage": "parsing", "status": "failed", "duration_ms": elapsed, "error": str(e)})
-            status["status"] = "failed"
-            self._persist_status(doc_id)
             shutil.move(file_path, str(Path(self._config.paths.failed_dir) / file_name))
-            self._logger.log(document=file_name, stage="parsing", status="failed", duration_ms=elapsed, details={"error": str(e)})
-            return
+            self._logger.log(document=file_name, stage="ingest", status="failed",
+                             details={"error": str(e)})
+            return {"error": "ingestion_failed", "reason": str(e)}
 
-        # Stage: extracting_metadata (with retry)
-        status["status"] = "extracting_metadata"
-        start = time.time()
+        # 3. Look up LightRAG doc_status record (doc_id is deterministic, so get_by_id is reliable)
+        doc = await self._rag.doc_status.get_by_id(doc_id)
+
+        # 4. Extract metadata from parsed content
         parsed_content = _read_parsed_content(self._config.paths.processed_dir, file_name)
         try:
-            metadata = await _retry_async(lambda: extract_metadata(parsed_content, self._config.llm))
+            metadata = await extract_metadata(parsed_content, self._config.llm, file_name=file_name)
         except Exception:
             metadata = {}
-        elapsed = int((time.time() - start) * 1000)
 
-        if metadata:
-            status["metadata"] = metadata
-            status["stages"].append({"stage": "extracting_metadata", "status": "success", "duration_ms": elapsed, "error": None})
-            self._logger.log(document=file_name, stage="extracting_metadata", status="success", duration_ms=elapsed, details=metadata)
-        else:
-            status["metadata"] = {}
-            status["stages"].append({"stage": "extracting_metadata", "status": "failed", "duration_ms": elapsed, "error": "Metadata extraction failed"})
-            status["status"] = "partial"
-            status["ingested_at"] = datetime.now(timezone.utc).isoformat()
-            self._persist_status(doc_id)
-            self._logger.log(document=file_name, stage="extracting_metadata", status="failed", duration_ms=elapsed)
-            shutil.move(file_path, str(Path(self._config.paths.processed_dir) / file_name))
-            return
-
-        # Stage: checking_version (skip for re-processed partial docs)
-        if not is_reprocess and metadata:
-            status["status"] = "checking_version"
-            existing_docs = [s for s in self._doc_statuses.values()
-                            if s["status"] in ("ready",) and s["document_id"] != doc_id]
-            match = find_existing_version(metadata, [s.get("metadata", {}) | {"document_id": s["document_id"]} for s in existing_docs if s.get("metadata")])
-            if match:
-                status["status"] = "awaiting_confirmation"
-                self._persist_status(doc_id)
-                status["stages"].append({"stage": "checking_version", "status": "awaiting_confirmation", "duration_ms": 0, "error": None})
-                status["metadata"]["_matched_doc_id"] = match["document_id"]
-                self._logger.log(document=file_name, stage="checking_version", status="awaiting_confirmation",
-                                details={"matched": match["document_id"]})
-                return
-            else:
-                status["stages"].append({"stage": "checking_version", "status": "no_match", "duration_ms": 0, "error": None})
-
-        # Stage: complete
-        status["status"] = "ready"
-        status["metadata"]["is_latest"] = True
-        status["ingested_at"] = datetime.now(timezone.utc).isoformat()
-        self._persist_status(doc_id)
-        shutil.move(file_path, str(Path(self._config.paths.processed_dir) / file_name))
-        self._logger.log(document=file_name, stage="complete", status="success")
-
-    async def recover_crashed(self) -> list[str]:
-        """Re-enqueue documents stuck in processing state after a crash."""
-        in_progress_states = ("parsing", "extracting_metadata", "checking_version", "validating")
-        recovered = []
-
-        for doc_id, status in list(self._doc_statuses.items()):
-            if status["status"] not in in_progress_states:
-                continue
-
-            file_path = status["file_path"]
-            if Path(file_path).exists():
-                status["status"] = "pending"
-                self._persist_status(doc_id)
-                await self._queue.put((doc_id, file_path))
-                recovered.append(file_path)
-            else:
-                status["status"] = "failed"
-                status["stages"].append({
-                    "stage": "recovery",
-                    "status": "failed",
-                    "duration_ms": 0,
-                    "error": "File not found after crash",
+        # 5. Enrich doc_status with metadata (read-spread-write)
+        if doc:
+            try:
+                await self._rag.doc_status.upsert({
+                    doc_id: {
+                        **doc,
+                        "status": "processed",
+                        "metadata": {
+                            **doc.get("metadata", {}),
+                            **metadata,
+                            "file_name": file_name,
+                        },
+                    }
                 })
-                self._persist_status(doc_id)
+            except Exception as e:
+                _logger.warning("Failed to enrich doc_status: %s", e)
 
-        return recovered
+        # 6. Move file
+        dest = Path(self._config.paths.processed_dir) / file_name
+        if Path(file_path).exists() and not dest.exists():
+            shutil.move(file_path, str(dest))
+
+        # 7. Log + notify
+        self._logger.log(document=file_name, stage="complete", status="success")
+        await self._notify_gateway(doc_id, file_name, "processed")
+
+        return {"doc_id": doc_id, "status": "processed", "metadata": metadata}
+
+    async def _notify_gateway(self, doc_id: str, file_name: str, status: str):
+        """Notify OpenClaw gateway that ingestion completed."""
+        if not self._callback_enabled:
+            return
+        import aiohttp
+        url = f"http://127.0.0.1:{self._gateway_port}/hooks/wake"
+        payload = {
+            "text": (
+                f"[入庫回調] {file_name} 完成，狀態：{status}，"
+                f"document_id: {doc_id}。按 HEARTBEAT.md 嘅「回調處理」流程執行。"
+            ),
+            "mode": "now",
+        }
+        headers = {"Authorization": f"Bearer {self._hooks_token}"}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, headers=headers,
+                                        timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status != 200:
+                        _logger.warning("Gateway callback failed: HTTP %d", resp.status)
+        except Exception as e:
+            _logger.warning("Gateway callback error: %s", e)
