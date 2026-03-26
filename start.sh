@@ -24,12 +24,12 @@ until curl -sf http://localhost:9200/_cluster/health &>/dev/null; do
 done
 echo " ✅ OpenSearch ready"
 
-echo "Waiting for Admin Backend..."
-until curl -sf http://localhost:8080/api/system/health &>/dev/null; do
+echo "Waiting for Admin Dashboard (via Caddy)..."
+until curl -sf http://localhost/api/system/health &>/dev/null; do
   sleep 2
   printf "."
 done
-echo " ✅ Admin Backend ready"
+echo " ✅ Admin Dashboard ready"
 
 # ─── Start MCP Server (local — needs Metal GPU) ─────────────────────────────
 echo ""
