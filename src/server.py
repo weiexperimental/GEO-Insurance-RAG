@@ -104,12 +104,15 @@ async def ingest(file_path: str) -> dict[str, Any]:
     except Exception:
         pass
 
-    # Synchronous: await ingestion to completion (fire-and-forget doesn't work with FastMCP stdio)
-    try:
-        result = await _ingestion.ingest(file_path)
-        return {"status": "completed", "file": Path(file_path).name, **result}
-    except Exception as e:
-        return _error_response("INGESTION_FAILED", f"[{Path(file_path).name}]: {e}")
+    # Fire-and-forget: return immediately, process in background
+    async def _bg():
+        try:
+            await _ingestion.ingest(file_path)
+        except Exception as e:
+            print(f"Ingest error [{Path(file_path).name}]: {e}", file=sys.stderr)
+
+    asyncio.create_task(_bg())
+    return {"started": True, "file": Path(file_path).name}
 
 
 @mcp.tool
@@ -124,16 +127,16 @@ async def ingest_all() -> dict[str, Any]:
     if not files:
         return {"total": 0, "results": []}
 
-    # Synchronous: process all sequentially (fire-and-forget doesn't work with FastMCP stdio)
-    results = []
-    for f in files:
-        try:
-            r = await _ingestion.ingest(str(f))
-            results.append({"file": f.name, **r})
-        except Exception as e:
-            results.append({"file": f.name, "error": str(e)})
+    # Fire-and-forget: return immediately, process all in background sequentially
+    async def _bg():
+        for f in files:
+            try:
+                await _ingestion.ingest(str(f))
+            except Exception as e:
+                print(f"Ingest error [{f.name}]: {e}", file=sys.stderr)
 
-    return {"total": len(files), "results": results}
+    asyncio.create_task(_bg())
+    return {"total": len(files), "started": True, "files": [f.name for f in files]}
 
 
 @mcp.tool
