@@ -175,6 +175,8 @@ class RAGEngine:
         return await self._rag.aquery(question, mode=mode, top_k=top_k)
 
     async def ingest_document(self, file_path: str, output_dir: str, device: str = "mps", lang: str = "ch", doc_id: str | None = None) -> None:
+        if self._rag is None:
+            raise RuntimeError("RAGEngine not initialized — call initialize() first")
         kwargs = dict(
             file_path=file_path,
             output_dir=output_dir,

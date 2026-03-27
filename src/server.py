@@ -82,13 +82,12 @@ async def ingest(file_path: str) -> dict[str, Any]:
     if not Path(file_path).exists():
         return _error_response("VALIDATION_FAILED", f"File not found: {file_path}")
 
-    # Pre-check dedup BEFORE fire-and-forget (so caller knows immediately)
+    # Pre-check dedup
     from src.ingestion import _file_doc_id
     doc_id = _file_doc_id(str(Path(file_path).resolve()))
     try:
         existing = await _rag_engine.doc_status.get_by_id(doc_id)
         if existing and existing.get("status") == "processed":
-            # Remove duplicate file — already ingested, no need to keep
             try:
                 Path(file_path).unlink()
             except OSError:
@@ -105,15 +104,12 @@ async def ingest(file_path: str) -> dict[str, Any]:
     except Exception:
         pass
 
-    # Fire-and-forget: return immediately, process in background via create_task
-    async def _bg():
-        try:
-            await _ingestion.ingest(file_path)
-        except Exception as e:
-            print(f"Ingest error [{Path(file_path).name}]: {e}", file=sys.stderr)
-
-    asyncio.create_task(_bg())
-    return {"started": True, "file": Path(file_path).name}
+    # Synchronous: await ingestion to completion (fire-and-forget doesn't work with FastMCP stdio)
+    try:
+        result = await _ingestion.ingest(file_path)
+        return {"status": "completed", "file": Path(file_path).name, **result}
+    except Exception as e:
+        return _error_response("INGESTION_FAILED", f"[{Path(file_path).name}]: {e}")
 
 
 @mcp.tool
@@ -128,16 +124,16 @@ async def ingest_all() -> dict[str, Any]:
     if not files:
         return {"total": 0, "results": []}
 
-    # Fire-and-forget: return immediately, process all in background sequentially
-    async def _bg():
-        for f in files:
-            try:
-                await _ingestion.ingest(str(f))
-            except Exception as e:
-                print(f"Ingest error [{f.name}]: {e}", file=sys.stderr)
+    # Synchronous: process all sequentially (fire-and-forget doesn't work with FastMCP stdio)
+    results = []
+    for f in files:
+        try:
+            r = await _ingestion.ingest(str(f))
+            results.append({"file": f.name, **r})
+        except Exception as e:
+            results.append({"file": f.name, "error": str(e)})
 
-    asyncio.create_task(_bg())
-    return {"total": len(files), "started": True, "files": [f.name for f in files]}
+    return {"total": len(files), "results": results}
 
 
 @mcp.tool
@@ -266,10 +262,7 @@ async def _initialize():
         opensearch_config=_config.opensearch,
         working_dir="./rag_working_dir",
     )
-    try:
-        await _rag_engine.initialize()
-    except Exception as e:
-        print(f"WARNING: RAG engine init failed: {e}", file=sys.stderr)
+    await _rag_engine.initialize()  # fail hard — no point running with broken RAG
 
     _ingestion = IngestionService(
         config=_config, rag_engine=_rag_engine, logger=_logger,
